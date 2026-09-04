@@ -12,6 +12,26 @@ const pool = new Pool({
   }
 });
 
+// Tự động khởi tạo bảng 'keys' nếu chưa tồn tại
+const initDb = async () => {
+  try {
+    const client = await pool.connect();
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS keys (
+        id SERIAL PRIMARY KEY,
+        "key" VARCHAR(255) UNIQUE NOT NULL,
+        expire_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    client.release();
+    console.log('Khởi tạo cấu trúc Database thành công!');
+  } catch (err) {
+    console.error('Lỗi khởi tạo Database:', err.message);
+  }
+};
+initDb();
+
 // Trang chủ
 app.get('/', (req, res) => {
   res.send('Key Verification Server is Running!');
@@ -29,9 +49,9 @@ app.all('/api/check-key', async (req, res) => {
       });
     }
 
-    // Truy vấn kiểm tra key trong DB
     const client = await pool.connect();
-    const result = await client.query('SELECT * FROM keys WHERE key = $1', [key]);
+    // Bọc "key" trong ngoặc kép để PostgreSQL nhận diện là tên cột
+    const result = await client.query('SELECT * FROM keys WHERE "key" = $1', [key]);
     client.release();
 
     if (result.rows.length === 0) {
