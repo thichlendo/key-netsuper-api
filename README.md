@@ -1,15 +1,25 @@
-# README
+# 🚀 Key Verification API (Netsuper)
 
-This is the [Express](https://expressjs.com) [Hello world](https://expressjs.com/en/starter/hello-world.html) example on [Render](https://render.com).
+API kiểm tra và xác thực License Key kết nối với cơ sở dữ liệu PostgreSQL, được triển khai trên [Render](https://render.com).
 
-The app in this repo is deployed at [https://express.onrender.com](https://express.onrender.com).
+## 📌 Tính năng chính
+* Xác thực key từ ứng dụng Android.
+* Kiểm tra thời hạn truy cập (Key 24h, Key vĩnh viễn...).
+* Tích hợp cơ sở dữ liệu PostgreSQL.
 
-## Deployment
+## 🌐 Endpoint API
 
-See https://render.com/docs/deploy-node-express-app or follow the steps below:
+### Check Key Status
+* **Method:** `GET` / `POST`
+* **URL:** `https://<your-render-url>/api/check-key?key=YOUR_KEY`
 
-Create a new web service with the following values:
-  * Build Command: `yarn`
-  * Start Command: `node app.js`
-
-That's it! Your web service will be live on your Render URL as soon as the build finishes.
+**Response Mẫu (Thành công):**
+```json
+{
+  "status": true,
+  "message": "Xác thực thành công!",
+  "data": {
+    "key": "NETSUPER-XXXX-XXXX",
+    "expire_at": "2026-12-31T23:59:59.000Z"
+  }
+}
