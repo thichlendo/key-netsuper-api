@@ -4,7 +4,7 @@ const { Pool } = require('pg');
 const app = express();
 app.use(express.json());
 
-// Cấu hình kết nối PostgreSQL với SSL hợp lệ cho Render
+// Cấu hình kết nối PostgreSQL với SSL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
@@ -12,34 +12,45 @@ const pool = new Pool({
   }
 });
 
-// Tự động khởi tạo bảng 'keys' nếu chưa tồn tại
+// ===== KHỞI TẠO DATABASE =====
 const initDb = async () => {
   try {
     const client = await pool.connect();
+    
+    // Tạo bảng keys với cột key_value (không dùng từ khóa "key")
     await client.query(`
       CREATE TABLE IF NOT EXISTS keys (
         id SERIAL PRIMARY KEY,
-        "key" VARCHAR(255) UNIQUE NOT NULL,
+        key_value VARCHAR(255) UNIQUE NOT NULL,
         expire_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+
+    // Thêm key mặc định nếu chưa có
+    await client.query(`
+      INSERT INTO keys (key_value, expire_at) 
+      VALUES ('0969696969', '2099-12-31 23:59:59')
+      ON CONFLICT (key_value) DO NOTHING;
+    `);
+
     client.release();
-    console.log('Khởi tạo cấu trúc Database thành công!');
+    console.log('✅ Database initialized successfully!');
   } catch (err) {
-    console.error('Lỗi khởi tạo Database:', err.message);
+    console.error('❌ Database init error:', err.message);
   }
 };
 initDb();
 
-// Trang chủ
+// ===== TRANG CHỦ =====
 app.get('/', (req, res) => {
   res.send('Key Verification Server is Running!');
 });
 
-// Endpoint kiểm tra Key
+// ===== ENDPOINT KIỂM TRA KEY =====
 app.all('/api/check-key', async (req, res) => {
   try {
+    // Lấy key từ query string hoặc body
     const key = req.query.key || req.body.key;
 
     if (!key) {
@@ -50,8 +61,9 @@ app.all('/api/check-key', async (req, res) => {
     }
 
     const client = await pool.connect();
-    // Bọc "key" trong ngoặc kép để PostgreSQL nhận diện là tên cột
-    const result = await client.query('SELECT * FROM keys WHERE "key" = $1', [key]);
+    
+    // Truy vấn với cột key_value (đã sửa)
+    const result = await client.query('SELECT * FROM keys WHERE key_value = $1', [key]);
     client.release();
 
     if (result.rows.length === 0) {
@@ -64,6 +76,7 @@ app.all('/api/check-key', async (req, res) => {
     const keyData = result.rows[0];
     const now = new Date();
 
+    // Kiểm tra hết hạn
     if (keyData.expire_at && new Date(keyData.expire_at) < now) {
       return res.json({
         status: false,
@@ -71,17 +84,18 @@ app.all('/api/check-key', async (req, res) => {
       });
     }
 
+    // Thành công
     return res.json({
       status: true,
       message: 'Xác thực thành công!',
       data: {
-        key: keyData.key,
+        key: keyData.key_value,
         expire_at: keyData.expire_at
       }
     });
 
   } catch (error) {
-    console.error('Database connection error:', error);
+    console.error('❌ Database error:', error);
     return res.status(500).json({
       status: false,
       message: 'Lỗi máy chủ kết nối Database!',
@@ -90,7 +104,39 @@ app.all('/api/check-key', async (req, res) => {
   }
 });
 
+// ===== ENDPOINT THÊM KEY MỚI (tùy chọn) =====
+app.post('/api/add-key', async (req, res) => {
+  try {
+    const { key, expire_at } = req.body;
+    
+    if (!key) {
+      return res.status(400).json({
+        status: false,
+        message: 'Vui lòng cung cấp key!'
+      });
+    }
+
+    const client = await pool.connect();
+    await client.query(
+      'INSERT INTO keys (key_value, expire_at) VALUES ($1, $2) ON CONFLICT (key_value) DO NOTHING',
+      [key, expire_at || '2099-12-31 23:59:59']
+    );
+    client.release();
+
+    res.json({
+      status: true,
+      message: 'Key đã được thêm thành công!'
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: false,
+      message: error.message
+    });
+  }
+});
+
+// ===== CHẠY SERVER =====
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+  console.log(`🚀 Server is running on port ${PORT}`);
 });
