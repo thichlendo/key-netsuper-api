@@ -1,9 +1,10 @@
 {
-  "name": "key-netsuper-api",
+  "name": "key-server",
   "version": "1.0.0",
-  "main": "app.js",
+  "description": "Key verification server",
+  "main": "index.js",
   "scripts": {
-    "start": "node app.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
