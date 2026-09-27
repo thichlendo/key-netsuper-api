@@ -13,7 +13,7 @@ const ADMIN_IPS = ['171.237.204.101'];
 const ADMIN_SERIALS = ['R9JN60KEPKJ'];
 const SERVER_URL = process.env.SERVER_URL || 'https://key-netsuper-api.onrender.com';
 
-// ⭐ Upstash Redis
+// Upstash Redis
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
@@ -99,16 +99,17 @@ async function redisPipeline(commands) {
     }
 }
 
-// 💾 Lưu key vào Redis với TTL tự động
+// 💾 Save key (dùng Hash — Upstash free tier cho phép)
 async function saveKeyToRedis(key, expireAt, hwid = '') {
     const ttl = Math.max(1, Math.ceil((expireAt - Date.now()) / 1000));
     const value = JSON.stringify({ hwid, createdAt: Date.now() });
     return await redisPipeline([
         ['SET', `ns:key:${key}`, value, 'EX', String(ttl)],
-        ['ZADD', 'ns:keys', String(expireAt), key]
+        ['HSET', 'ns:meta', key, String(expireAt)]
     ]);
 }
 
+// 🔑 Get key
 async function getKeyFromRedis(key) {
     const value = await redis('GET', `ns:key:${key}`);
     if (!value) return null;
@@ -119,47 +120,47 @@ async function getKeyFromRedis(key) {
     }
 }
 
+// 🗑️ Delete key
 async function deleteKeyFromRedis(key) {
     return await redisPipeline([
         ['DEL', `ns:key:${key}`],
-        ['ZREM', 'ns:keys', key]
+        ['HDEL', 'ns:meta', key]
     ]);
 }
 
+// 📋 List keys (dùng HGETALL — Upstash free tier cho phép)
 async function listKeysFromRedis() {
     const now = Date.now();
+    const meta = await redis('HGETALL', 'ns:meta');
 
-    // 1) Clean expired
-    await redis('ZREMRANGEBYSCORE', 'ns:keys', '-inf', `(${now}`);
+    if (!meta || !Array.isArray(meta) || meta.length === 0) return [];
 
-    // 2) Get valid keys
-    const raw = await redis('ZRANGEBYSCORE', 'ns:keys', `(${now}`, '+inf', 'WITHSCORES');
-    if (!raw || !Array.isArray(raw) || raw.length === 0) return [];
+    const result = [];
+    const expired = [];
 
-    const keys = [];
-    const scores = [];
-    for (let i = 0; i < raw.length; i += 2) {
-        keys.push(raw[i]);
-        scores.push(parseInt(raw[i + 1], 10));
+    for (let i = 0; i < meta.length; i += 2) {
+        const key = meta[i];
+        const expireAt = parseInt(meta[i + 1], 10);
+        if (!key || isNaN(expireAt)) continue;
+
+        if (expireAt > now) {
+            result.push({ key, expireAt, hwid: 'free' });
+        } else {
+            expired.push(key);
+        }
     }
 
-    // 3) Batch GET values
-    const commands = keys.map(k => ['GET', `ns:key:${k}`]);
-    const values = await redisPipeline(commands);
+    // Clean expired keys khỏi Hash
+    if (expired.length > 0) {
+        const cmds = expired.map(k => ['HDEL', 'ns:meta', k]);
+        await redisPipeline(cmds);
+    }
 
-    return keys.map((key, i) => {
-        let hwid = 'free';
-        try {
-            const v = values && values[i] ? values[i].result : null;
-            const parsed = JSON.parse(v || '{}');
-            hwid = parsed.hwid || 'free';
-        } catch (e) {}
-        return { key, expireAt: scores[i], hwid };
-    });
+    return result;
 }
 
 // ============================================
-// STORAGE IN RAM (tạm thời — không cần persist)
+// STORAGE IN RAM (không cần persist)
 // ============================================
 const tasks = new Map();
 const bypassLog = [];
@@ -335,9 +336,10 @@ app.get('/api/check-key', async (req, res) => {
         return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
     }
 
-    const score = await redis('ZSCORE', 'ns:keys', key);
-    const exp = score
-        ? Math.floor(parseInt(score, 10) / 1000)
+    // Lấy expire từ TTL (không dùng ZSCORE)
+    const ttl = await redis('TTL', `ns:key:${key}`);
+    const exp = (ttl && ttl > 0)
+        ? Math.floor((Date.now() + ttl * 1000) / 1000)
         : Math.floor(Date.now() / 1000) + 3600;
 
     return res.json({ p: JSON.stringify({ ok: 1, exp }), s: 'x' });
@@ -560,7 +562,7 @@ app.get('/api/step-callback', async (req, res) => {
         const duration = task.hours * 3600 * 1000;
         const expireAt = Date.now() + duration;
 
-        // ⭐ Lưu vào Redis (không mất khi deploy)
+        // Lưu vào Redis
         await saveKeyToRedis(key, expireAt);
 
         task.key = key;
@@ -644,7 +646,6 @@ app.post('/api/unblock-ip', (req, res) => {
     return res.json({ ok: true });
 });
 
-// Health check
 app.get('/api/health', async (req, res) => {
     const ping = await redis('PING');
     res.json({ ok: true, redis: ping === 'PONG' });
@@ -790,7 +791,7 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace;font-variant-nu
 <div id="bypassLogList"></div>
 </div>
 
-<div class="hint">✦ Crafted by ThichLenDo · v2.0 (Redis) ✦</div>
+<div class="hint">✦ Crafted by ThichLenDo · v2.1 (Redis Hash) ✦</div>
 </div>
 
 <script>
@@ -798,7 +799,6 @@ let keysData = [];
 let countdownTimer = null;
 let syncTimer = null;
 
-// Health check
 (async () => {
   try {
     const r = await fetch('/api/health');
@@ -812,7 +812,6 @@ let syncTimer = null;
   } catch (e) {}
 })();
 
-// Verify admin
 (async () => {
   const r = await fetch('/api/verify-admin', {method:'POST'});
   const j = await r.json();
