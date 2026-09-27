@@ -13,12 +13,23 @@ const ADMIN_IPS = ['171.237.204.101'];
 const ADMIN_SERIALS = ['R9JN60KEPKJ'];
 const SERVER_URL = process.env.SERVER_URL || 'https://key-netsuper-api.onrender.com';
 
+// ⭐ Upstash Redis
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+if (!UPSTASH_URL || !UPSTASH_TOKEN) {
+    console.error('❌ Thiếu UPSTASH_REDIS_REST_URL hoặc UPSTASH_REDIS_REST_TOKEN');
+}
+
+// Link4M
 const LINK4M_API_KEY = '6a61ce8626fd3a13155f6529';
 const LINK4M_API_URL = 'https://link4m.co/api-shorten/v2';
 
+// TrafficVN
 const TRAFFICVN_API_KEY = 'b19399e1906b7bad23ed21c078a1edf7';
 const TRAFFICVN_API_URL = 'https://trafficvn.com/apidevelop';
 
+// Duration config
 const DURATION_CONFIG = {
     '3h':  { hours: 3,  steps: ['link4m'] },
     '6h':  { hours: 6,  steps: ['link4m', 'trafficvn'] },
@@ -27,27 +38,129 @@ const DURATION_CONFIG = {
     '24h': { hours: 24, steps: ['link4m', 'trafficvn', 'trafficvn', 'trafficvn', 'trafficvn'] }
 };
 
+// Anti-bypass
 const MIN_LINK4M_MS = 80 * 1000;
 const MIN_TRAFFICVN_MS = 90 * 1000;
-
-// 🚫 Anti-bypass config
 const VALID_REFERERS = [
     'link4m.co', 'www.link4m.co', 'link4m.com', 'www.link4m.com',
     'trafficvn.com', 'www.trafficvn.com'
 ];
-
 const BAD_UA_PATTERNS = [
     'curl', 'wget', 'python', 'python-requests', 'python-urllib',
     'okhttp', 'postman', 'insomnia', 'axios', 'node-fetch',
     'go-http-client', 'java/', 'libwww', 'httpie', 'powershell',
     'headlesschrome', 'phantomjs', 'selenium', 'puppeteer', 'playwright'
 ];
-
 const RATE_LIMIT_WINDOW = 60 * 60 * 1000;
 const RATE_LIMIT_MAX = 5;
 
-// Storage
-const keys = new Map();
+// ============================================
+// UPSTASH REDIS HELPERS
+// ============================================
+async function redis(...args) {
+    if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
+    try {
+        const r = await fetch(UPSTASH_URL, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${UPSTASH_TOKEN}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(args)
+        });
+        const j = await r.json();
+        if (j.error) {
+            console.error('Redis error:', j.error);
+            return null;
+        }
+        return j.result;
+    } catch (e) {
+        console.error('Redis fetch error:', e.message);
+        return null;
+    }
+}
+
+async function redisPipeline(commands) {
+    if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
+    try {
+        const r = await fetch(`${UPSTASH_URL}/pipeline`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${UPSTASH_TOKEN}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(commands)
+        });
+        const j = await r.json();
+        return j;
+    } catch (e) {
+        console.error('Redis pipeline error:', e.message);
+        return null;
+    }
+}
+
+// 💾 Lưu key vào Redis với TTL tự động
+async function saveKeyToRedis(key, expireAt, hwid = '') {
+    const ttl = Math.max(1, Math.ceil((expireAt - Date.now()) / 1000));
+    const value = JSON.stringify({ hwid, createdAt: Date.now() });
+    return await redisPipeline([
+        ['SET', `ns:key:${key}`, value, 'EX', String(ttl)],
+        ['ZADD', 'ns:keys', String(expireAt), key]
+    ]);
+}
+
+async function getKeyFromRedis(key) {
+    const value = await redis('GET', `ns:key:${key}`);
+    if (!value) return null;
+    try {
+        return JSON.parse(value);
+    } catch (e) {
+        return {};
+    }
+}
+
+async function deleteKeyFromRedis(key) {
+    return await redisPipeline([
+        ['DEL', `ns:key:${key}`],
+        ['ZREM', 'ns:keys', key]
+    ]);
+}
+
+async function listKeysFromRedis() {
+    const now = Date.now();
+
+    // 1) Clean expired
+    await redis('ZREMRANGEBYSCORE', 'ns:keys', '-inf', `(${now}`);
+
+    // 2) Get valid keys
+    const raw = await redis('ZRANGEBYSCORE', 'ns:keys', `(${now}`, '+inf', 'WITHSCORES');
+    if (!raw || !Array.isArray(raw) || raw.length === 0) return [];
+
+    const keys = [];
+    const scores = [];
+    for (let i = 0; i < raw.length; i += 2) {
+        keys.push(raw[i]);
+        scores.push(parseInt(raw[i + 1], 10));
+    }
+
+    // 3) Batch GET values
+    const commands = keys.map(k => ['GET', `ns:key:${k}`]);
+    const values = await redisPipeline(commands);
+
+    return keys.map((key, i) => {
+        let hwid = 'free';
+        try {
+            const v = values && values[i] ? values[i].result : null;
+            const parsed = JSON.parse(v || '{}');
+            hwid = parsed.hwid || 'free';
+        } catch (e) {}
+        return { key, expireAt: scores[i], hwid };
+    });
+}
+
+// ============================================
+// STORAGE IN RAM (tạm thời — không cần persist)
+// ============================================
 const tasks = new Map();
 const bypassLog = [];
 const ipBlacklist = new Map();
@@ -137,19 +250,6 @@ function isIPBlacklisted(ip) {
     return false;
 }
 
-// 🧹 Auto-cleanup: xóa key hết hạn mỗi 30s
-setInterval(() => {
-    const now = Date.now();
-    let removed = 0;
-    for (const [k, v] of keys) {
-        if (v.expire <= now) {
-            keys.delete(k);
-            removed++;
-        }
-    }
-    if (removed > 0) console.log(`Cleaned ${removed} expired keys`);
-}, 30 * 1000);
-
 // ============================================
 // ANTI-BYPASS DETECTOR
 // ============================================
@@ -160,7 +260,6 @@ function detectBypass(req, task, stepType) {
     const currentReferer = req.headers['referer'] || req.headers['referrer'] || '';
     const elapsed = Date.now() - task.stepStartedAt;
 
-    // 1️⃣ Thời gian
     let minTime = 0;
     if (stepType === 'link4m') minTime = MIN_LINK4M_MS;
     else if (stepType === 'trafficvn') minTime = MIN_TRAFFICVN_MS;
@@ -171,12 +270,10 @@ function detectBypass(req, task, stepType) {
         reasons.push(`Thời gian quá ngắn (${actual}s < ${required}s)`);
     }
 
-    // 2️⃣ IP
     if (currentIP !== task.stepIP) {
         reasons.push(`IP thay đổi (${task.stepIP} → ${currentIP})`);
     }
 
-    // 3️⃣ User-Agent
     const uaLower = currentUA.toLowerCase();
     if (!currentUA) {
         reasons.push('Thiếu User-Agent');
@@ -192,14 +289,12 @@ function detectBypass(req, task, stepType) {
         }
     }
 
-    // 4️⃣ Referer BẮT BUỘC
     if (!currentReferer) {
         reasons.push('Thiếu Referer (không qua link)');
     } else if (!isRefererValid(currentReferer)) {
         reasons.push(`Referer không hợp lệ (${currentReferer.substring(0, 60)})`);
     }
 
-    // 5️⃣ Replay
     const callbackKey = `${task.duration}-${task.currentStep}`;
     if (task.callbackHistory && task.callbackHistory.includes(callbackKey)) {
         reasons.push('Token đã được dùng (replay detected)');
@@ -218,29 +313,33 @@ function detectBypass(req, task, stepType) {
 }
 
 // ============================================
-// API: /api/check-key
+// API: check-key
 // ============================================
-app.get('/api/check-key', (req, res) => {
+app.get('/api/check-key', async (req, res) => {
     const key = req.query.key;
     const hwid = req.query.hwid || '';
 
     if (!key) return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
 
-    const entry = keys.get(key);
+    const entry = await getKeyFromRedis(key);
     if (!entry) return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
 
-    if (Date.now() > entry.expire) {
-        keys.delete(key);
-        return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
-    }
-
+    // HWID bind
     if (!entry.hwid) {
         entry.hwid = hwid;
+        const ttl = await redis('TTL', `ns:key:${key}`);
+        if (ttl && ttl > 0) {
+            await redis('SET', `ns:key:${key}`, JSON.stringify(entry), 'EX', String(ttl));
+        }
     } else if (entry.hwid !== hwid && hwid) {
         return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
     }
 
-    const exp = Math.floor(entry.expire / 1000);
+    const score = await redis('ZSCORE', 'ns:keys', key);
+    const exp = score
+        ? Math.floor(parseInt(score, 10) / 1000)
+        : Math.floor(Date.now() / 1000) + 3600;
+
     return res.json({ p: JSON.stringify({ ok: 1, exp }), s: 'x' });
 });
 
@@ -406,7 +505,7 @@ app.get('/api/continue-task', async (req, res) => {
 // ============================================
 // API: step-callback
 // ============================================
-app.get('/api/step-callback', (req, res) => {
+app.get('/api/step-callback', async (req, res) => {
     const { token, step } = req.query;
     const task = tasks.get(token);
     if (!task) return res.status(403).send('invalid');
@@ -431,9 +530,7 @@ app.get('/api/step-callback', (req, res) => {
             const label = type === 'link4m' ? 'Link4M' : 'TrafficVN';
             task.bypassReason = `Bypass link ${label}. Chi tiết: ${check.reasons.join(' | ')}`;
 
-            if (!task.isAdmin) {
-                markIPBlacklisted(getClientIP(req));
-            }
+            markIPBlacklisted(getClientIP(req));
 
             bypassLog.unshift({
                 time: vnTime(new Date()),
@@ -461,16 +558,13 @@ app.get('/api/step-callback', (req, res) => {
     if (task.completedSteps >= task.totalSteps) {
         const key = genKey();
         const duration = task.hours * 3600 * 1000;
-        const expire = Date.now() + duration;
+        const expireAt = Date.now() + duration;
 
-        keys.set(key, {
-            expire,
-            hwid: '',
-            createdAt: Date.now()
-        });
+        // ⭐ Lưu vào Redis (không mất khi deploy)
+        await saveKeyToRedis(key, expireAt);
 
         task.key = key;
-        task.keyExpire = vnTime(new Date(expire));
+        task.keyExpire = vnTime(new Date(expireAt));
         task.done = true;
     }
 
@@ -487,7 +581,7 @@ app.post('/api/verify-admin', (req, res) => {
 // ============================================
 // API ADMIN
 // ============================================
-app.post('/api/create-key', (req, res) => {
+app.post('/api/create-key', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
     const { content, hours, minutes, seconds } = req.body;
     if (!content) return res.json({ ok: false });
@@ -496,11 +590,8 @@ app.post('/api/create-key', (req, res) => {
     if (ms <= 0) return res.json({ ok: false });
 
     const expireAt = Date.now() + ms;
-    keys.set(content, {
-        expire: expireAt,
-        hwid: '',
-        createdAt: Date.now()
-    });
+    await saveKeyToRedis(content, expireAt);
+
     return res.json({
         ok: true,
         key: content,
@@ -509,30 +600,22 @@ app.post('/api/create-key', (req, res) => {
     });
 });
 
-app.post('/api/delete-key', (req, res) => {
+app.post('/api/delete-key', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
-    keys.delete(req.body.key);
+    await deleteKeyFromRedis(req.body.key);
     return res.json({ ok: true });
 });
 
-// ⭐ Trả về expireAt để client tự đếm ngược real-time
-app.post('/api/list-keys', (req, res) => {
+app.post('/api/list-keys', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
 
-    const out = [];
-    const now = Date.now();
-    for (const [k, v] of keys) {
-        if (v.expire <= now) {
-            keys.delete(k);
-            continue;
-        }
-        out.push({
-            key: k,
-            expireAt: v.expire,            // ⭐ timestamp ms cho countdown
-            expire: vnTime(new Date(v.expire)),
-            hwid: v.hwid || 'free'
-        });
-    }
+    const list = await listKeysFromRedis();
+    const out = list.map(v => ({
+        key: v.key,
+        expireAt: v.expireAt,
+        expire: vnTime(new Date(v.expireAt)),
+        hwid: v.hwid || 'free'
+    }));
     return res.json({ ok: true, keys: out });
 });
 
@@ -559,6 +642,12 @@ app.post('/api/unblock-ip', (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
     ipBlacklist.delete(req.body.ip);
     return res.json({ ok: true });
+});
+
+// Health check
+app.get('/api/health', async (req, res) => {
+    const ping = await redis('PING');
+    res.json({ ok: true, redis: ping === 'PONG' });
 });
 
 // ============================================
@@ -659,11 +748,14 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace;font-variant-nu
 .log-item .meta{color:var(--text-faint);margin-top:4px;font-size:10px}
 .row-expiring{animation:fadeOut 1s ease forwards}
 @keyframes fadeOut{to{opacity:0;transform:translateX(-10px)}}
+.status-badge{display:inline-flex;align-items:center;gap:5px;font-size:10px;padding:3px 8px;border-radius:10px;margin-left:8px}
+.status-online{background:rgba(47,217,168,.15);color:var(--emerald);border:1px solid rgba(47,217,168,.3)}
+.status-offline{background:rgba(255,93,108,.15);color:var(--red);border:1px solid rgba(255,93,108,.3)}
 </style>
 </head><body>
 <div class="wrap">
 <h1>NETSUPER</h1>
-<div class="tagline">Cổng lấy key cao cấp — nhanh, an toàn, minh bạch</div>
+<div class="tagline">Cổng lấy key cao cấp — nhanh, an toàn, minh bạch<span id="redisBadge"></span></div>
 
 <div class="card">
 <h2>Get Key</h2>
@@ -698,53 +790,50 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace;font-variant-nu
 <div id="bypassLogList"></div>
 </div>
 
-<div class="hint">✦ Crafted by ThichLenDo · v1.3 ✦</div>
+<div class="hint">✦ Crafted by ThichLenDo · v2.0 (Redis) ✦</div>
 </div>
 
 <script>
-// ============================================================
-// STATE
-// ============================================================
-let keysData = [];        // [{key, expireAt, expire, hwid}]
+let keysData = [];
 let countdownTimer = null;
 let syncTimer = null;
 
-// ============================================================
-// VERIFY ADMIN
-// ============================================================
+// Health check
+(async () => {
+  try {
+    const r = await fetch('/api/health');
+    const j = await r.json();
+    const badge = document.getElementById('redisBadge');
+    if (j.redis) {
+      badge.innerHTML = '<span class="status-badge status-online">● REDIS</span>';
+    } else {
+      badge.innerHTML = '<span class="status-badge status-offline">● OFFLINE</span>';
+    }
+  } catch (e) {}
+})();
+
+// Verify admin
 (async () => {
   const r = await fetch('/api/verify-admin', {method:'POST'});
   const j = await r.json();
   if (j.isAdmin) {
     document.getElementById('adminPanel').style.display = 'block';
     document.getElementById('bypassLogPanel').style.display = 'block';
-
-    // Load lần đầu
     await syncKeys();
     loadBypassLog();
-
-    // ⏱️ Timer 1s để update countdown real-time
     countdownTimer = setInterval(updateCountdowns, 1000);
-
-    // 🔄 Sync server mỗi 30s (thay vì 5s)
     syncTimer = setInterval(syncKeys, 30000);
     setInterval(loadBypassLog, 15000);
   }
 })();
 
-// ============================================================
-// COUNTDOWN HELPERS
-// ============================================================
 function formatCountdown(ms) {
   if (ms <= 0) return '00s';
   const totalSec = Math.floor(ms / 1000);
   const h = Math.floor(totalSec / 3600);
   const m = Math.floor((totalSec % 3600) / 60);
   const s = totalSec % 60;
-
-  // Đệm 0 cho đẹp
   const pad = n => String(n).padStart(2, '0');
-
   if (h > 0) return pad(h) + 'h' + pad(m) + 'm' + pad(s) + 's';
   if (m > 0) return pad(m) + 'm' + pad(s) + 's';
   return pad(s) + 's';
@@ -765,17 +854,13 @@ function updateCountdowns() {
     const remainCell = row.querySelector('.r');
 
     if (remain <= 0) {
-      // Hết hạn → fade out rồi xóa
       if (!row.classList.contains('row-expiring')) {
         row.classList.add('row-expiring');
         remainCell.textContent = '00s';
         setTimeout(() => {
           row.remove();
           keysData = keysData.filter(k => k.key !== key);
-          // Nếu rỗng → hiện empty
-          if (keysData.length === 0) {
-            renderKeysTable([]);
-          }
+          if (keysData.length === 0) renderKeysTable([]);
         }, 1000);
       }
       return;
@@ -785,9 +870,6 @@ function updateCountdowns() {
   });
 }
 
-// ============================================================
-// SYNC + RENDER
-// ============================================================
 async function syncKeys() {
   try {
     const r = await fetch('/api/list-keys', {method:'POST'});
@@ -809,13 +891,12 @@ function renderKeysTable(list) {
     return;
   }
 
-  // Build lại bảng
   tb.innerHTML = '';
   const now = Date.now();
 
   list.forEach(k => {
     const remain = k.expireAt - now;
-    if (remain <= 0) return; // bỏ qua key đã hết hạn
+    if (remain <= 0) return;
 
     const tr = document.createElement('tr');
     tr.setAttribute('data-key', k.key);
@@ -856,9 +937,6 @@ function renderKeysTable(list) {
   });
 }
 
-// ============================================================
-// GET KEY / MENU
-// ============================================================
 function toggleMenu() {
   const m = document.getElementById('durationMenu');
   const btn = document.getElementById('getKeyBtn');
@@ -896,9 +974,6 @@ async function startTask(duration) {
   location.href = j.taskUrl;
 }
 
-// ============================================================
-// CREATE KEY
-// ============================================================
 function showMsg(t, ok) {
   const m = document.getElementById('msg');
   m.textContent = t;
@@ -922,7 +997,6 @@ async function createKey() {
   const j = await r.json();
   if (j.ok) {
     showMsg('OK ' + j.key, true);
-    // Thêm ngay vào list local để countdown chạy tức thì
     keysData.push({
       key: j.key,
       expireAt: j.expireAt,
@@ -934,9 +1008,6 @@ async function createKey() {
   }
 }
 
-// ============================================================
-// BYPASS LOG
-// ============================================================
 async function loadBypassLog() {
   try {
     const r = await fetch('/api/bypass-log', {method:'POST'});
@@ -1173,4 +1244,4 @@ polling = setInterval(refresh, 3000);
 
 // ============================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Server running on port ' + PORT));
+app.listen(PORT, () => console.log('✅ Server running on port ' + PORT));
