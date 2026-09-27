@@ -17,12 +17,11 @@ const SERVER_URL = process.env.SERVER_URL || 'https://key-netsuper-api.onrender.
 const LINK4M_API_KEY = '6a61ce8626fd3a13155f6529';
 const LINK4M_API_URL = 'https://link4m.co/api-shorten/v2';
 
-// TrafficVN
+// TrafficVN — endpoint ĐÚNG là /apidevelop
 const TRAFFICVN_API_KEY = 'b19399e1906b7bad23ed21c078a1edf7';
-const TRAFFICVN_API_URL = 'https://trafficvn.com/api';
-const TRAFFICVN_FALLBACK = 'https://www.google.com';
+const TRAFFICVN_API_URL = 'https://trafficvn.com/apidevelop';
 
-// Duration config — mỗi mức có list step tương ứng
+// Duration config
 const DURATION_CONFIG = {
     '3h':  { hours: 3,  steps: ['link4m'] },
     '6h':  { hours: 6,  steps: ['link4m', 'trafficvn'] },
@@ -32,8 +31,8 @@ const DURATION_CONFIG = {
 };
 
 // Storage
-const keys = new Map();     // key -> { expire, hwid, createdAt }
-const tasks = new Map();    // token -> { duration, steps, currentStep, done, key, ... }
+const keys = new Map();
+const tasks = new Map();
 
 // ============================================
 // HELPERS
@@ -63,7 +62,7 @@ function getClientIP(req) {
 
 function isAdmin(req) {
     const ip = getClientIP(req);
-    const serial = req.body?.serial || req.query?.serial;
+    const serial = (req.body && req.body.serial) || req.query.serial;
     return ADMIN_IPS.includes(ip) || (serial && ADMIN_SERIALS.includes(String(serial).trim()));
 }
 
@@ -76,31 +75,26 @@ function genKey() {
 }
 
 // ============================================
-// ⭐ API: /api/check-key — app gọi để verify key
-// Trả về format: { p: "<json>", s: "x" }
+// API: /api/check-key — app gọi để verify key
 // ============================================
 app.get('/api/check-key', (req, res) => {
     const key = req.query.key;
     const hwid = req.query.hwid || '';
 
-    if (!key) {
-        return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
-    }
+    if (!key) return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
 
     const entry = keys.get(key);
-    if (!entry) {
-        return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
-    }
+    if (!entry) return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
 
     if (Date.now() > entry.expire) {
         keys.delete(key);
         return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
     }
 
-    // Nếu muốn HWID bind
+    // HWID bind (nếu key đã được dùng ở máy khác)
     if (!entry.hwid) {
         entry.hwid = hwid;
-    } else if (entry.hwid !== hwid) {
+    } else if (entry.hwid !== hwid && hwid) {
         return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
     }
 
@@ -109,7 +103,7 @@ app.get('/api/check-key', (req, res) => {
 });
 
 // ============================================
-// API: start-task — app gọi để bắt đầu flow get key
+// API: start-task
 // ============================================
 app.post('/api/start-task', (req, res) => {
     const { duration } = req.body;
@@ -130,7 +124,6 @@ app.post('/api/start-task', (req, res) => {
         createdAt: Date.now()
     });
 
-    // auto-expire sau 30 phút
     setTimeout(() => tasks.delete(token), 30 * 60 * 1000);
 
     return res.json({
@@ -143,7 +136,7 @@ app.post('/api/start-task', (req, res) => {
 });
 
 // ============================================
-// API: task-status — check tiến độ
+// API: task-status
 // ============================================
 app.get('/api/task-status', (req, res) => {
     const { token } = req.query;
@@ -165,7 +158,7 @@ app.get('/api/task-status', (req, res) => {
 });
 
 // ============================================
-// API: continue-task — tạo link cho step hiện tại
+// API: continue-task
 // ============================================
 app.get('/api/continue-task', async (req, res) => {
     const { token } = req.query;
@@ -177,10 +170,12 @@ app.get('/api/continue-task', async (req, res) => {
     if (step >= task.steps.length) return res.json({ ok: false, message: 'all_steps_done' });
 
     const type = task.steps[step];
-    const cb = `${SERVER_URL}/api/step-callback?token=${token}&step=${step}`;
+    // Thêm random để tránh trùng URL
+    const cb = `${SERVER_URL}/api/step-callback?token=${token}&step=${step}&r=${Date.now()}`;
 
     try {
         let shortUrl = null;
+        let raw = null;
 
         if (type === 'link4m') {
             const params = new URLSearchParams({
@@ -189,25 +184,29 @@ app.get('/api/continue-task', async (req, res) => {
                 format: 'json'
             });
             const r = await fetch(`${LINK4M_API_URL}?${params.toString()}`);
-            const j = await r.json();
-            if (j.status === 'success' && j.shortenedUrl) {
-                shortUrl = j.shortenedUrl;
+            raw = await r.json();
+
+            if (raw.status === 'success' && raw.shortenedUrl) {
+                shortUrl = raw.shortenedUrl;
             } else {
-                return res.json({ ok: false, message: 'link4m_error', raw: j });
+                return res.json({ ok: false, message: 'link4m_error', raw });
             }
 
         } else if (type === 'trafficvn') {
+            // Endpoint ĐÚNG: /apidevelop
             const params = new URLSearchParams({
                 api: TRAFFICVN_API_KEY,
                 url: cb,
-                fallback_url: TRAFFICVN_FALLBACK
+                fallback_url: cb
             });
             const r = await fetch(`${TRAFFICVN_API_URL}?${params.toString()}`);
-            const j = await r.json();
-            // TrafficVN có thể trả format khác, thử nhiều key
-            shortUrl = j.shortenedUrl || j.short_url || j.shortened || j.url || j.data?.shortenedUrl;
+            raw = await r.json();
+
+            // TrafficVN trả về shortenedUrl
+            shortUrl = raw.shortenedUrl || raw.short_url || raw.url;
+
             if (!shortUrl) {
-                return res.json({ ok: false, message: 'trafficvn_error', raw: j });
+                return res.json({ ok: false, message: 'trafficvn_error', raw });
             }
 
         } else {
@@ -228,7 +227,7 @@ app.get('/api/continue-task', async (req, res) => {
 });
 
 // ============================================
-// API: step-callback — Link4M/TrafficVN gọi về
+// API: step-callback
 // ============================================
 app.get('/api/step-callback', (req, res) => {
     const { token, step } = req.query;
@@ -237,7 +236,6 @@ app.get('/api/step-callback', (req, res) => {
 
     const stepNum = parseInt(step, 10);
     if (stepNum !== task.currentStep) {
-        // Đã hoặc sai step → quay về task page
         return res.redirect(`${SERVER_URL}/task?token=${token}`);
     }
 
@@ -245,7 +243,6 @@ app.get('/api/step-callback', (req, res) => {
     task.currentStep++;
 
     if (task.completedSteps >= task.totalSteps) {
-        // ✅ Hoàn thành tất cả step → sinh key
         const key = genKey();
         const duration = task.hours * 3600 * 1000;
         const expire = Date.now() + duration;
@@ -263,12 +260,11 @@ app.get('/api/step-callback', (req, res) => {
         return res.redirect(`${SERVER_URL}/task?token=${token}`);
     }
 
-    // Còn step tiếp theo → về task page
     res.redirect(`${SERVER_URL}/task?token=${token}`);
 });
 
 // ============================================
-// API: verify-admin (cho web)
+// API: verify-admin
 // ============================================
 app.post('/api/verify-admin', (req, res) => {
     return res.json({ isAdmin: isAdmin(req), ip: getClientIP(req) });
@@ -318,13 +314,10 @@ app.post('/api/list-keys', (req, res) => {
 });
 
 // ============================================
-// ROUTE: / — trang chủ
+// ROUTES
 // ============================================
 app.get('/', (req, res) => res.send(MAIN_HTML));
 
-// ============================================
-// ROUTE: /task — trang xử lý các bước
-// ============================================
 app.get('/task', (req, res) => {
     const token = req.query.token || '';
     res.send(renderTaskPage(token));
@@ -349,7 +342,6 @@ button{width:100%;padding:14px;background:#00f2fe;border:none;border-radius:8px;
 button:active{opacity:.7}
 .btn-purple{background:#8b5cf6;color:#fff}
 .btn-green{background:#10b981;color:#fff}
-.btn-small{padding:10px;font-size:12px}
 label{display:block;font-size:11px;color:#666;margin:8px 0 4px;text-transform:uppercase}
 input{width:100%;padding:10px;background:#0a0a0a;border:1px solid #333;border-radius:8px;color:#fff;font-family:monospace;font-size:13px}
 input:focus{outline:none;border-color:#00f2fe}
@@ -408,7 +400,6 @@ td.r{color:#10b981}
 </div>
 
 <script>
-// ===== ADMIN VERIFY =====
 (async () => {
   const r = await fetch('/api/verify-admin', {method:'POST'});
   const j = await r.json();
@@ -419,7 +410,6 @@ td.r{color:#10b981}
   }
 })();
 
-// ===== DURATION MENU =====
 function toggleMenu() {
   const m = document.getElementById('durationMenu');
   const btn = document.getElementById('getKeyBtn');
@@ -432,7 +422,6 @@ function toggleMenu() {
   }
 }
 
-// ===== START TASK =====
 async function startTask(duration) {
   const status = document.getElementById('getKeyStatus');
   status.style.display = 'block';
@@ -454,11 +443,9 @@ async function startTask(duration) {
   status.textContent = 'Opening ' + duration + ' task (' + j.totalSteps + ' steps)...';
   status.style.color = '#10b981';
 
-  // Mở trang task
   location.href = j.taskUrl;
 }
 
-// ===== ADMIN =====
 function showMsg(t, ok) {
   const m = document.getElementById('msg');
   m.textContent = t;
@@ -542,6 +529,7 @@ button:disabled{background:#333;color:#555;cursor:not-allowed}
 .copybtn{background:#10b981;color:#fff}
 .status{text-align:center;color:#888;font-size:12px;margin-top:12px}
 .duration-badge{display:inline-block;background:#8b5cf644;color:#c4b5fd;padding:4px 10px;border-radius:6px;font-size:11px}
+.err{color:#ef4444}
 </style>
 </head><body>
 <div class="card">
@@ -565,7 +553,6 @@ async function refresh() {
   document.getElementById('sub').innerHTML =
     'Duration: <span class="duration-badge">' + j.duration.toUpperCase() + '</span>';
 
-  // Render steps
   const prog = document.getElementById('progress');
   prog.innerHTML = '';
   j.steps.forEach((type, i) => {
@@ -580,7 +567,6 @@ async function refresh() {
     prog.appendChild(row);
   });
 
-  // Actions
   const acts = document.getElementById('actions');
   acts.innerHTML = '';
 
@@ -601,12 +587,12 @@ async function refresh() {
     acts.appendChild(btn);
 
     const doneBtn = document.createElement('button');
-    doneBtn.textContent = 'DONE — BACK TO APP';
+    doneBtn.textContent = 'BACK TO APP';
     doneBtn.style.background = '#8b5cf6';
     doneBtn.style.color = '#fff';
     doneBtn.onclick = () => {
-      window.close();
-      // hoặc history.back()
+      try { window.close(); } catch(e) {}
+      setTimeout(() => history.back(), 200);
     };
     acts.appendChild(doneBtn);
 
@@ -615,7 +601,6 @@ async function refresh() {
     return;
   }
 
-  // Nút continue
   const btn = document.createElement('button');
   btn.textContent = 'CONTINUE STEP ' + (j.currentStep + 1) + ' →';
   btn.onclick = () => continueTask(btn);
@@ -628,22 +613,28 @@ async function continueTask(btn) {
   btn.disabled = true;
   btn.textContent = 'Loading link...';
 
-  const r = await fetch('/api/continue-task?token=' + token);
-  const j = await r.json();
+  try {
+    const r = await fetch('/api/continue-task?token=' + token);
+    const j = await r.json();
 
-  if (j.done) return refresh();
-  if (!j.ok) {
-    btn.textContent = 'Error: ' + (j.message || 'unknown');
+    if (j.done) return refresh();
+    if (!j.ok) {
+      btn.textContent = 'Error: ' + (j.message || 'unknown');
+      btn.disabled = false;
+      setTimeout(refresh, 2000);
+      return;
+    }
+
+    btn.textContent = 'Redirecting...';
+    location.href = j.url;
+  } catch (e) {
+    btn.textContent = 'Network error';
     btn.disabled = false;
-    return;
   }
-
-  btn.textContent = 'Redirecting...';
-  location.href = j.url;
 }
 
 function showError(t) {
-  document.getElementById('sub').textContent = t;
+  document.getElementById('sub').innerHTML = '<span class="err">' + t + '</span>';
   document.getElementById('progress').innerHTML = '';
   document.getElementById('actions').innerHTML = '';
   document.getElementById('status').textContent = '';
@@ -657,4 +648,4 @@ polling = setInterval(refresh, 3000);
 
 // ============================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('ok port ' + PORT));
+app.listen(PORT, () => console.log('Server running on port ' + PORT));
