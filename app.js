@@ -2,10 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const app = express();
 
-// ⚠️ QUAN TRỌNG: Bật trust proxy để đọc đúng IP thật
-// Render.com dùng proxy → nếu không bật, req.ip sẽ trả IP của load balancer
 app.set('trust proxy', true);
-
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -13,35 +10,22 @@ app.use(express.urlencoded({ extended: true }));
 // CONFIG
 // ============================================
 const ADMIN_IPS = [
-    '171.237.204.101',    // IP nhà admin
-    // '14.225.xx.xx',    // thêm IP khác nếu muốn
+    '171.237.204.101',
 ];
-
+const ADMIN_SERIALS = [
+    'R9JN60KEPKJ',
+];
 const LINK4M_API_KEY = '6a61ce8626fd3a13155f6529';
 const LINK4M_API_URL = 'https://link4m.co/api-shorten/v2';
 const SERVER_URL = process.env.SERVER_URL || 'https://key-netsuper-api.onrender.com';
 
-// In-memory
-const keys = new Map();
-const pending = new Map();
+// In-memory storage
+const keys = new Map();      // key -> { expire, hwid, createdAt }
+const pending = new Map();   // token -> { verified }
 
 // ============================================
 // HELPERS
 // ============================================
-function getClientIP(req) {
-    // Render đặt IP thật ở header x-forwarded-for
-    const fwd = req.headers['x-forwarded-for'];
-    if (fwd) {
-        // Có thể có nhiều IP: "client, proxy1, proxy2"
-        return String(fwd).split(',')[0].trim();
-    }
-    return req.ip || req.connection?.remoteAddress || '';
-}
-
-function isAdminIP(ip) {
-    return ADMIN_IPS.includes(String(ip).trim());
-}
-
 function vnTime(d) {
     const t = new Date(d.getTime() + 7 * 3600 * 1000);
     const p = n => String(n).padStart(2, '0');
@@ -59,36 +43,79 @@ function remain(ms) {
     return `${sec}s`;
 }
 
+function getClientIP(req) {
+    const fwd = req.headers['x-forwarded-for'];
+    if (fwd) return String(fwd).split(',')[0].trim();
+    return req.ip || '';
+}
+
+function isAdminIP(req) {
+    return ADMIN_IPS.includes(getClientIP(req));
+}
+
+function isAdminSerial(s) {
+    return s && ADMIN_SERIALS.includes(String(s).trim());
+}
+
+function isAdmin(req) {
+    return isAdminIP(req) || isAdminSerial(req.body?.serial || req.query?.serial);
+}
+
 function genToken() {
     return crypto.randomBytes(16).toString('hex');
 }
 
 // ============================================
-// API: check-key
+// ⭐ API QUAN TRỌNG: /api/check-key
+// App gọi để verify key
 // ============================================
 app.get('/api/check-key', (req, res) => {
     const key = req.query.key;
-    if (!key) return res.status(400).json({ status: false });
-    const e = keys.get(key);
-    if (!e) return res.json({ status: false, message: 'invalid' });
-    if (Date.now() > e.expire) { keys.delete(key); return res.json({ status: false, message: 'expired' }); }
-    return res.json({ status: true });
+    const hwid = req.query.hwid || '';
+
+    if (!key) {
+        const p = JSON.stringify({ ok: 0 });
+        return res.json({ p, s: 'x' });
+    }
+
+    const entry = keys.get(key);
+
+    // Key không tồn tại
+    if (!entry) {
+        const p = JSON.stringify({ ok: 0 });
+        return res.json({ p, s: 'x' });
+    }
+
+    // Key hết hạn
+    if (Date.now() > entry.expire) {
+        keys.delete(key);
+        const p = JSON.stringify({ ok: 0 });
+        return res.json({ p, s: 'x' });
+    }
+
+    // ✅ OK
+    const exp = Math.floor(entry.expire / 1000);
+    const p = JSON.stringify({ ok: 1, exp });
+
+    // Nếu muốn gắn HWID (chống share key):
+    // - Lần đầu: lưu hwid vào entry
+    // - Lần sau: check hwid trùng
+    if (!entry.hwid) {
+        entry.hwid = hwid;
+    } else if (entry.hwid !== hwid) {
+        // Key đã dùng ở máy khác
+        const p2 = JSON.stringify({ ok: 0 });
+        return res.json({ p: p2, s: 'x' });
+    }
+
+    res.json({ p, s: 'x' });
 });
 
 // ============================================
-// API: verify-admin (check IP)
-// ============================================
-app.post('/api/verify-admin', (req, res) => {
-    const ip = getClientIP(req);
-    return res.json({ isAdmin: isAdminIP(ip), ip: ip });
-});
-
-// ============================================
-// API: create-key (admin only)
+// API ADMIN: Tạo key
 // ============================================
 app.post('/api/create-key', (req, res) => {
-    const ip = getClientIP(req);
-    if (!isAdminIP(ip)) return res.status(403).json({ ok: false });
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
 
     const { content, hours, minutes, seconds } = req.body;
     if (!content) return res.json({ ok: false, message: 'no_content' });
@@ -96,39 +123,57 @@ app.post('/api/create-key', (req, res) => {
     const ms = (Number(hours)||0)*3600000 + (Number(minutes)||0)*60000 + (Number(seconds)||0)*1000;
     if (ms <= 0) return res.json({ ok: false, message: 'bad_duration' });
 
-    keys.set(content, { expire: Date.now() + ms, createdAt: Date.now() });
-    return res.json({ ok: true, key: content, expire: vnTime(new Date(Date.now() + ms)) });
+    keys.set(content, {
+        expire: Date.now() + ms,
+        hwid: '',
+        createdAt: Date.now()
+    });
+    return res.json({
+        ok: true,
+        key: content,
+        expire: vnTime(new Date(Date.now() + ms))
+    });
 });
 
 // ============================================
-// API: delete-key (admin only)
+// API ADMIN: Xóa key
 // ============================================
 app.post('/api/delete-key', (req, res) => {
-    const ip = getClientIP(req);
-    if (!isAdminIP(ip)) return res.status(403).json({ ok: false });
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
     keys.delete(req.body.key);
     return res.json({ ok: true });
 });
 
 // ============================================
-// API: list-keys (admin only)
+// API ADMIN: Danh sách key
 // ============================================
 app.post('/api/list-keys', (req, res) => {
-    const ip = getClientIP(req);
-    if (!isAdminIP(ip)) return res.status(403).json({ ok: false });
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
 
     const out = [];
     const now = Date.now();
     for (const [k, v] of keys) {
         const r = v.expire - now;
         if (r <= 0) { keys.delete(k); continue; }
-        out.push({ key: k, remaining: remain(r), expire: vnTime(new Date(v.expire)) });
+        out.push({
+            key: k,
+            remaining: remain(r),
+            expire: vnTime(new Date(v.expire)),
+            hwid: v.hwid || 'free'
+        });
     }
     return res.json({ ok: true, keys: out });
 });
 
 // ============================================
-// API: request-token
+// API: check admin (dùng cho web)
+// ============================================
+app.post('/api/verify-admin', (req, res) => {
+    return res.json({ isAdmin: isAdmin(req), ip: getClientIP(req) });
+});
+
+// ============================================
+// API: request-token (Link4M flow)
 // ============================================
 app.post('/api/request-token', (req, res) => {
     const token = genToken();
@@ -146,7 +191,11 @@ app.post('/api/get-link4m', async (req, res) => {
 
     const cb = `${SERVER_URL}/api/link4m-callback?token=${token}`;
     try {
-        const params = new URLSearchParams({ api: LINK4M_API_KEY, url: cb, format: 'json' });
+        const params = new URLSearchParams({
+            api: LINK4M_API_KEY,
+            url: cb,
+            format: 'json'
+        });
         const r = await fetch(`${LINK4M_API_URL}?${params.toString()}`);
         const j = await r.json();
         if (j.status !== 'success' || !j.shortenedUrl) return res.json({ ok: false, raw: j });
@@ -163,9 +212,16 @@ app.get('/api/link4m-callback', (req, res) => {
     const { token } = req.query;
     if (!token || !pending.has(token)) return res.status(403).send('forbidden');
     pending.get(token).verified = true;
-    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OK</title>
-<style>body{font-family:monospace;background:#0a0a0a;color:#10b981;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;flex-direction:column}
-h1{font-size:20px}p{color:#666;font-size:13px;margin-top:12px}a{color:#00f2fe;margin-top:20px;text-decoration:none;padding:12px 24px;border:1px solid #00f2fe;border-radius:8px}</style>
+    res.send(`<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OK</title>
+<style>
+body{font-family:monospace;background:#0a0a0a;color:#10b981;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;flex-direction:column}
+h1{font-size:20px}
+p{color:#666;font-size:13px;margin-top:12px}
+a{color:#00f2fe;margin-top:20px;text-decoration:none;padding:12px 24px;border:1px solid #00f2fe;border-radius:8px}
+</style>
 </head><body>
 <h1>VERIFIED</h1>
 <p>Get your key now</p>
@@ -174,7 +230,7 @@ h1{font-size:20px}p{color:#666;font-size:13px;margin-top:12px}a{color:#00f2fe;ma
 });
 
 // ============================================
-// API: get-key
+// API: get-key (sau khi vượt Link4M)
 // ============================================
 app.post('/api/get-key', (req, res) => {
     const { token } = req.body;
@@ -183,23 +239,36 @@ app.post('/api/get-key', (req, res) => {
     if (!p.verified) return res.status(403).json({ ok: false, message: 'not_verified' });
     pending.delete(token);
 
-    const key = crypto.randomBytes(8).toString('hex').toUpperCase();
+    const key = 'NS-' + crypto.randomBytes(6).toString('hex').toUpperCase();
     const duration = 24 * 3600 * 1000;
-    keys.set(key, { expire: Date.now() + duration, createdAt: Date.now() });
-    return res.json({ ok: true, key, expire: vnTime(new Date(Date.now() + duration)) });
+    keys.set(key, {
+        expire: Date.now() + duration,
+        hwid: '',
+        createdAt: Date.now()
+    });
+    return res.json({
+        ok: true,
+        key,
+        expire: vnTime(new Date(Date.now() + duration))
+    });
 });
 
 // ============================================
-// ROUTE: /get-key
+// ROUTE: /get-key (page hiện key)
 // ============================================
 app.get('/get-key', (req, res) => {
-    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Get Key</title>
-<style>body{font-family:monospace;background:#0a0a0a;color:#fff;padding:20px;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+    res.send(`<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Get Key</title>
+<style>
+body{font-family:monospace;background:#0a0a0a;color:#fff;padding:20px;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
 .card{background:#141414;border:1px solid #222;border-radius:16px;padding:24px;max-width:400px;width:100%;text-align:center}
 h1{color:#00f2fe;font-size:16px;margin:0 0 16px}
 #key{background:#0a0a0a;border:1px solid #333;border-radius:8px;padding:16px;font-size:16px;color:#10b981;word-break:break-all;margin:16px 0}
 button{background:#00f2fe;color:#000;border:none;padding:12px 24px;border-radius:8px;font-weight:700;cursor:pointer;width:100%}
-.err{color:#ef4444}</style>
+.err{color:#ef4444}
+</style>
 </head><body>
 <div class="card">
 <h1>YOUR KEY</h1>
@@ -209,7 +278,11 @@ button{background:#00f2fe;color:#000;border:none;padding:12px 24px;border-radius
 <script>
 const token = new URLSearchParams(location.search).get('token');
 async function load() {
-  const r = await fetch('/api/get-key', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token})});
+  const r = await fetch('/api/get-key', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({token})
+  });
   const j = await r.json();
   if (j.ok) document.getElementById('key').textContent = j.key;
   else document.getElementById('key').innerHTML = '<span class="err">ERROR</span>';
@@ -224,14 +297,14 @@ load();
 });
 
 // ============================================
-// ROUTE: / (main)
+// ROUTE: / (trang chủ)
 // ============================================
 app.get('/', (req, res) => {
     res.send(MAIN_HTML);
 });
 
 // ============================================
-// MAIN HTML
+// MAIN HTML (trang chủ + admin panel ẩn)
 // ============================================
 const MAIN_HTML = `<!DOCTYPE html>
 <html><head>
@@ -286,7 +359,7 @@ td.r{color:#10b981}
 </div>
 <button onclick="createKey()">CREATE KEY</button>
 <div id="msg"></div>
-<table id="tbl"><thead><tr><th>KEY</th><th>REMAIN</th><th>EXPIRE</th><th></th></tr></thead><tbody></tbody></table>
+<table id="tbl"><thead><tr><th>KEY</th><th>REMAIN</th><th>EXPIRE</th><th>HWID</th><th></th></tr></thead><tbody></tbody></table>
 </div>
 
 <div class="hint">v1.0</div>
@@ -354,12 +427,12 @@ async function loadKeys() {
   const tb = document.querySelector('#tbl tbody');
   tb.innerHTML = '';
   if (!j.ok || !j.keys.length) {
-    tb.innerHTML = '<tr><td colspan="4" style="color:#444;text-align:center">empty</td></tr>';
+    tb.innerHTML = '<tr><td colspan="5" style="color:#444;text-align:center">empty</td></tr>';
     return;
   }
   j.keys.forEach(k => {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td class="k">' + k.key + '</td><td class="r">' + k.remaining + '</td><td>' + k.expire + '</td>';
+    tr.innerHTML = '<td class="k">' + k.key + '</td><td class="r">' + k.remaining + '</td><td>' + k.expire + '</td><td>' + (k.hwid ? k.hwid.substring(0,8) : 'free') + '</td>';
     const td = document.createElement('td');
     const b = document.createElement('button');
     b.className = 'del'; b.textContent = 'X';
