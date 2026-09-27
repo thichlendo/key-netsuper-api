@@ -13,15 +13,12 @@ const ADMIN_IPS = ['171.237.204.101'];
 const ADMIN_SERIALS = ['R9JN60KEPKJ'];
 const SERVER_URL = process.env.SERVER_URL || 'https://key-netsuper-api.onrender.com';
 
-// Link4M
 const LINK4M_API_KEY = '6a61ce8626fd3a13155f6529';
 const LINK4M_API_URL = 'https://link4m.co/api-shorten/v2';
 
-// TrafficVN
 const TRAFFICVN_API_KEY = 'b19399e1906b7bad23ed21c078a1edf7';
 const TRAFFICVN_API_URL = 'https://trafficvn.com/apidevelop';
 
-// Duration config — kèm thời gian tối thiểu mỗi link
 const DURATION_CONFIG = {
     '3h':  { hours: 3,  steps: ['link4m'] },
     '6h':  { hours: 6,  steps: ['link4m', 'trafficvn'] },
@@ -30,13 +27,31 @@ const DURATION_CONFIG = {
     '24h': { hours: 24, steps: ['link4m', 'trafficvn', 'trafficvn', 'trafficvn', 'trafficvn'] }
 };
 
-// ⏱️ Thời gian tối thiểu mỗi link (ms)
-const MIN_LINK4M_MS = 80 * 1000;      // 80 giây
-const MIN_TRAFFICVN_MS = 90 * 1000;   // 90 giây
+const MIN_LINK4M_MS = 80 * 1000;
+const MIN_TRAFFICVN_MS = 90 * 1000;
+
+// 🚫 Anti-bypass config
+const VALID_REFERERS = [
+    'link4m.co', 'www.link4m.co', 'link4m.com', 'www.link4m.com',
+    'trafficvn.com', 'www.trafficvn.com'
+];
+
+const BAD_UA_PATTERNS = [
+    'curl', 'wget', 'python', 'python-requests', 'python-urllib',
+    'okhttp', 'postman', 'insomnia', 'axios', 'node-fetch',
+    'go-http-client', 'java/', 'libwww', 'httpie', 'powershell',
+    'headlesschrome', 'phantomjs', 'selenium', 'puppeteer', 'playwright'
+];
+
+const RATE_LIMIT_WINDOW = 60 * 60 * 1000;
+const RATE_LIMIT_MAX = 5;
 
 // Storage
 const keys = new Map();
 const tasks = new Map();
+const bypassLog = [];
+const ipBlacklist = new Map();
+const ipTaskLog = new Map();
 
 // ============================================
 // HELPERS
@@ -45,17 +60,6 @@ function vnTime(d) {
     const t = new Date(d.getTime() + 7 * 3600 * 1000);
     const p = n => String(n).padStart(2, '0');
     return `${p(t.getUTCHours())}:${p(t.getUTCMinutes())}:${p(t.getUTCSeconds())} ${p(t.getUTCDate())}/${t.getUTCMonth()+1}/${t.getUTCFullYear()}`;
-}
-
-function remain(ms) {
-    if (ms <= 0) return 'expired';
-    const s = Math.floor(ms / 1000);
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
-    if (h > 0) return `${h}h${m}m${sec}s`;
-    if (m > 0) return `${m}m${sec}s`;
-    return `${sec}s`;
 }
 
 function getClientIP(req) {
@@ -78,7 +82,6 @@ function genToken() {
     return crypto.randomBytes(16).toString('hex');
 }
 
-// 🎲 Format key: NETSUPER-XXXX-XXXX-XXXX
 function genKey() {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
     const block = () => {
@@ -87,6 +90,131 @@ function genKey() {
         return s;
     };
     return `NETSUPER-${block()}-${block()}-${block()}`;
+}
+
+function isRefererValid(referer) {
+    if (!referer) return false;
+    try {
+        const url = new URL(referer);
+        const host = url.hostname.toLowerCase();
+        return VALID_REFERERS.includes(host);
+    } catch (e) {
+        return false;
+    }
+}
+
+function isIPRateLimited(ip) {
+    const now = Date.now();
+    const log = ipTaskLog.get(ip) || [];
+    const recent = log.filter(t => now - t < RATE_LIMIT_WINDOW);
+    return recent.length >= RATE_LIMIT_MAX;
+}
+
+function logIPTask(ip) {
+    const now = Date.now();
+    const log = ipTaskLog.get(ip) || [];
+    log.push(now);
+    if (log.length > 100) log.shift();
+    ipTaskLog.set(ip, log);
+}
+
+function markIPBlacklisted(ip) {
+    const entry = ipBlacklist.get(ip) || { count: 0, until: 0 };
+    entry.count++;
+    if (entry.count >= 3) {
+        entry.until = Date.now() + 24 * 3600 * 1000;
+    }
+    ipBlacklist.set(ip, entry);
+}
+
+function isIPBlacklisted(ip) {
+    const entry = ipBlacklist.get(ip);
+    if (!entry) return false;
+    if (entry.until > Date.now()) return true;
+    if (entry.until > 0 && entry.until <= Date.now()) {
+        ipBlacklist.delete(ip);
+    }
+    return false;
+}
+
+// 🧹 Auto-cleanup: xóa key hết hạn mỗi 30s
+setInterval(() => {
+    const now = Date.now();
+    let removed = 0;
+    for (const [k, v] of keys) {
+        if (v.expire <= now) {
+            keys.delete(k);
+            removed++;
+        }
+    }
+    if (removed > 0) console.log(`Cleaned ${removed} expired keys`);
+}, 30 * 1000);
+
+// ============================================
+// ANTI-BYPASS DETECTOR
+// ============================================
+function detectBypass(req, task, stepType) {
+    const reasons = [];
+    const currentIP = getClientIP(req);
+    const currentUA = req.headers['user-agent'] || '';
+    const currentReferer = req.headers['referer'] || req.headers['referrer'] || '';
+    const elapsed = Date.now() - task.stepStartedAt;
+
+    // 1️⃣ Thời gian
+    let minTime = 0;
+    if (stepType === 'link4m') minTime = MIN_LINK4M_MS;
+    else if (stepType === 'trafficvn') minTime = MIN_TRAFFICVN_MS;
+
+    if (elapsed < minTime) {
+        const required = Math.round(minTime / 1000);
+        const actual = Math.round(elapsed / 1000);
+        reasons.push(`Thời gian quá ngắn (${actual}s < ${required}s)`);
+    }
+
+    // 2️⃣ IP
+    if (currentIP !== task.stepIP) {
+        reasons.push(`IP thay đổi (${task.stepIP} → ${currentIP})`);
+    }
+
+    // 3️⃣ User-Agent
+    const uaLower = currentUA.toLowerCase();
+    if (!currentUA) {
+        reasons.push('Thiếu User-Agent');
+    } else {
+        for (const bad of BAD_UA_PATTERNS) {
+            if (uaLower.includes(bad)) {
+                reasons.push(`User-Agent bị chặn (${bad})`);
+                break;
+            }
+        }
+        if (!uaLower.includes('mozilla') && !uaLower.includes('chrome') && !uaLower.includes('safari') && !uaLower.includes('firefox')) {
+            reasons.push('User-Agent không phải trình duyệt');
+        }
+    }
+
+    // 4️⃣ Referer BẮT BUỘC
+    if (!currentReferer) {
+        reasons.push('Thiếu Referer (không qua link)');
+    } else if (!isRefererValid(currentReferer)) {
+        reasons.push(`Referer không hợp lệ (${currentReferer.substring(0, 60)})`);
+    }
+
+    // 5️⃣ Replay
+    const callbackKey = `${task.duration}-${task.currentStep}`;
+    if (task.callbackHistory && task.callbackHistory.includes(callbackKey)) {
+        reasons.push('Token đã được dùng (replay detected)');
+    }
+
+    return {
+        bypass: reasons.length > 0,
+        reasons: reasons,
+        details: {
+            elapsed: Math.round(elapsed / 1000) + 's',
+            ip: currentIP,
+            expectedIP: task.stepIP,
+            ua: currentUA.substring(0, 100)
+        }
+    };
 }
 
 // ============================================
@@ -120,12 +248,30 @@ app.get('/api/check-key', (req, res) => {
 // API: start-task
 // ============================================
 app.post('/api/start-task', (req, res) => {
+    const clientIP = getClientIP(req);
+
+    if (isIPBlacklisted(clientIP) && !isAdminIP(req)) {
+        return res.status(429).json({
+            ok: false,
+            message: 'ip_blocked',
+            reason: 'IP đã bị chặn do bypass nhiều lần'
+        });
+    }
+
+    if (isIPRateLimited(clientIP) && !isAdminIP(req)) {
+        return res.status(429).json({
+            ok: false,
+            message: 'rate_limited',
+            reason: 'Quá nhiều task. Chờ 1 giờ.'
+        });
+    }
+
     const { duration } = req.body;
     const config = DURATION_CONFIG[duration];
     if (!config) return res.status(400).json({ ok: false, message: 'bad_duration' });
 
     const token = genToken();
-    const clientIP = getClientIP(req);
+    const userAgent = req.headers['user-agent'] || '';
 
     tasks.set(token, {
         duration,
@@ -138,14 +284,18 @@ app.post('/api/start-task', (req, res) => {
         key: null,
         keyExpire: null,
         createdAt: Date.now(),
-        // Anti-bypass
         clientIP: clientIP,
+        clientUA: userAgent,
         isAdmin: isAdminIP(req),
         stepStartedAt: 0,
+        stepIP: '',
+        stepUA: '',
         bypassed: false,
-        bypassReason: null
+        bypassReason: null,
+        callbackHistory: []
     });
 
+    logIPTask(clientIP);
     setTimeout(() => tasks.delete(token), 30 * 60 * 1000);
 
     return res.json({
@@ -198,8 +348,9 @@ app.get('/api/continue-task', async (req, res) => {
     const type = task.steps[step];
     const cb = `${SERVER_URL}/api/step-callback?token=${token}&step=${step}&r=${Date.now()}`;
 
-    // 📌 Ghi lại thời điểm bắt đầu step
     task.stepStartedAt = Date.now();
+    task.stepIP = getClientIP(req);
+    task.stepUA = req.headers['user-agent'] || '';
 
     try {
         let shortUrl = null;
@@ -253,7 +404,7 @@ app.get('/api/continue-task', async (req, res) => {
 });
 
 // ============================================
-// API: step-callback — có anti-bypass
+// API: step-callback
 // ============================================
 app.get('/api/step-callback', (req, res) => {
     const { token, step } = req.query;
@@ -265,30 +416,47 @@ app.get('/api/step-callback', (req, res) => {
         return res.redirect(`${SERVER_URL}/task?token=${token}`);
     }
 
-    // ⏱️ Kiểm tra thời gian
-    const elapsed = Date.now() - task.stepStartedAt;
+    const cbKey = `${task.duration}-${stepNum}`;
+    if (!task.callbackHistory.includes(cbKey)) {
+        task.callbackHistory.push(cbKey);
+    }
+
     const type = task.steps[stepNum];
 
-    // ⚠️ Bỏ qua check nếu là ADMIN
     if (!task.isAdmin) {
-        let minTime = 0;
-        if (type === 'link4m') minTime = MIN_LINK4M_MS;
-        else if (type === 'trafficvn') minTime = MIN_TRAFFICVN_MS;
+        const check = detectBypass(req, task, type);
 
-        if (elapsed < minTime) {
-            // 🚫 BYPASS DETECTED
+        if (check.bypass) {
             task.bypassed = true;
             const label = type === 'link4m' ? 'Link4M' : 'TrafficVN';
-            const required = Math.round(minTime / 1000);
-            const actual = Math.round(elapsed / 1000);
-            task.bypassReason = `Bạn đã bypass link ${label}! Yêu cầu tối thiểu ${required}s nhưng chỉ mất ${actual}s.`;
+            task.bypassReason = `Bypass link ${label}. Chi tiết: ${check.reasons.join(' | ')}`;
+
+            if (!task.isAdmin) {
+                markIPBlacklisted(getClientIP(req));
+            }
+
+            bypassLog.unshift({
+                time: vnTime(new Date()),
+                ip: check.details.ip,
+                ua: check.details.ua,
+                duration: task.duration,
+                step: stepNum + 1,
+                total: task.totalSteps,
+                type,
+                reasons: check.reasons,
+                elapsed: check.details.elapsed
+            });
+            if (bypassLog.length > 100) bypassLog.pop();
+
             return res.redirect(`${SERVER_URL}/task?token=${token}`);
         }
     }
 
-    // ✅ Hợp lệ
     task.completedSteps++;
     task.currentStep++;
+    task.stepStartedAt = 0;
+    task.stepIP = '';
+    task.stepUA = '';
 
     if (task.completedSteps >= task.totalSteps) {
         const key = genKey();
@@ -327,12 +495,18 @@ app.post('/api/create-key', (req, res) => {
     const ms = (Number(hours)||0)*3600000 + (Number(minutes)||0)*60000 + (Number(seconds)||0)*1000;
     if (ms <= 0) return res.json({ ok: false });
 
+    const expireAt = Date.now() + ms;
     keys.set(content, {
-        expire: Date.now() + ms,
+        expire: expireAt,
         hwid: '',
         createdAt: Date.now()
     });
-    return res.json({ ok: true, key: content, expire: vnTime(new Date(Date.now() + ms)) });
+    return res.json({
+        ok: true,
+        key: content,
+        expireAt: expireAt,
+        expire: vnTime(new Date(expireAt))
+    });
 });
 
 app.post('/api/delete-key', (req, res) => {
@@ -341,22 +515,50 @@ app.post('/api/delete-key', (req, res) => {
     return res.json({ ok: true });
 });
 
+// ⭐ Trả về expireAt để client tự đếm ngược real-time
 app.post('/api/list-keys', (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
 
     const out = [];
     const now = Date.now();
     for (const [k, v] of keys) {
-        const r = v.expire - now;
-        if (r <= 0) { keys.delete(k); continue; }
+        if (v.expire <= now) {
+            keys.delete(k);
+            continue;
+        }
         out.push({
             key: k,
-            remaining: remain(r),
+            expireAt: v.expire,            // ⭐ timestamp ms cho countdown
             expire: vnTime(new Date(v.expire)),
             hwid: v.hwid || 'free'
         });
     }
     return res.json({ ok: true, keys: out });
+});
+
+app.post('/api/bypass-log', (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
+    return res.json({ ok: true, logs: bypassLog.slice(0, 50) });
+});
+
+app.post('/api/blacklist', (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
+    const out = [];
+    for (const [ip, entry] of ipBlacklist) {
+        out.push({
+            ip,
+            count: entry.count,
+            blocked: entry.until > Date.now(),
+            until: entry.until > 0 ? vnTime(new Date(entry.until)) : '-'
+        });
+    }
+    return res.json({ ok: true, list: out });
+});
+
+app.post('/api/unblock-ip', (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
+    ipBlacklist.delete(req.body.ip);
+    return res.json({ ok: true });
 });
 
 // ============================================
@@ -419,12 +621,11 @@ button{
   font-family:'Sora',sans-serif;font-weight:700;font-size:14px;
   background:linear-gradient(135deg,var(--gold-soft),var(--gold));color:#1a1204;
   box-shadow:0 10px 24px -10px rgba(227,182,90,.55);
-  transition:transform .15s ease,opacity .15s ease,box-shadow .15s ease;
+  transition:transform .15s ease,opacity .15s ease;
 }
 button:hover{transform:translateY(-1px)}
 button:active{transform:translateY(0);opacity:.85}
 button:disabled{background:#232838;color:var(--text-faint);box-shadow:none;cursor:not-allowed;transform:none}
-button:focus-visible{outline:2px solid var(--gold-soft);outline-offset:2px}
 .btn-purple{background:linear-gradient(135deg,#a89bff,var(--violet));color:#fff;box-shadow:0 10px 24px -10px rgba(138,124,255,.5)}
 .btn-green{background:linear-gradient(135deg,#5eead4,var(--emerald));color:#04231b;box-shadow:0 10px 24px -10px rgba(47,217,168,.5)}
 label{display:block;font-size:11px;color:var(--text-faint);margin:12px 0 6px;font-weight:500}
@@ -439,8 +640,8 @@ input:focus{outline:none;border-color:var(--gold);box-shadow:0 0 0 3px rgba(227,
 table{width:100%;font-size:12px;border-collapse:collapse;margin-top:10px}
 th,td{padding:9px 6px;text-align:left;border-bottom:1px solid var(--border)}
 th{color:var(--text-faint);font-weight:600;font-size:10px;letter-spacing:.3px}
-td.k{color:var(--gold-soft);font-family:'JetBrains Mono',monospace;font-size:11px}
-td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
+td.k{color:var(--gold-soft);font-family:'JetBrains Mono',monospace;font-size:11px;word-break:break-all}
+td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace;font-variant-numeric:tabular-nums}
 .del{background:rgba(255,93,108,.12);color:var(--red);border:1px solid rgba(255,93,108,.3);padding:5px 10px;border-radius:8px;cursor:pointer;width:auto;font-size:11px;margin:0}
 .del:hover{background:rgba(255,93,108,.2)}
 #msg{text-align:center;padding:10px;border-radius:10px;margin-top:10px;font-size:12px;display:none;font-weight:500}
@@ -453,6 +654,11 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
 #durationMenu button b{font-family:'Sora',sans-serif;color:var(--gold-soft);display:block;font-size:19px}
 #durationMenu button span{font-size:10.5px;color:var(--text-faint);display:block;margin-top:3px}
 .hint{color:var(--text-faint);font-size:11px;text-align:center;margin-top:26px;letter-spacing:.3px}
+.log-item{background:var(--bg-2);border:1px solid var(--border);border-radius:10px;padding:10px;margin:6px 0;font-size:11px;font-family:'JetBrains Mono',monospace}
+.log-item .bad{color:var(--red);font-weight:600}
+.log-item .meta{color:var(--text-faint);margin-top:4px;font-size:10px}
+.row-expiring{animation:fadeOut 1s ease forwards}
+@keyframes fadeOut{to{opacity:0;transform:translateX(-10px)}}
 </style>
 </head><body>
 <div class="wrap">
@@ -487,20 +693,172 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
 <table id="tbl"><thead><tr><th>KEY</th><th>REMAIN</th><th>EXPIRE</th><th></th></tr></thead><tbody></tbody></table>
 </div>
 
-<div class="hint">✦ Crafted by ThichLenDo · v1.1 ✦</div>
+<div class="card" id="bypassLogPanel" style="display:none">
+<h2>Bypass Log</h2>
+<div id="bypassLogList"></div>
+</div>
+
+<div class="hint">✦ Crafted by ThichLenDo · v1.3 ✦</div>
 </div>
 
 <script>
+// ============================================================
+// STATE
+// ============================================================
+let keysData = [];        // [{key, expireAt, expire, hwid}]
+let countdownTimer = null;
+let syncTimer = null;
+
+// ============================================================
+// VERIFY ADMIN
+// ============================================================
 (async () => {
   const r = await fetch('/api/verify-admin', {method:'POST'});
   const j = await r.json();
   if (j.isAdmin) {
     document.getElementById('adminPanel').style.display = 'block';
-    loadKeys();
-    setInterval(loadKeys, 5000);
+    document.getElementById('bypassLogPanel').style.display = 'block';
+
+    // Load lần đầu
+    await syncKeys();
+    loadBypassLog();
+
+    // ⏱️ Timer 1s để update countdown real-time
+    countdownTimer = setInterval(updateCountdowns, 1000);
+
+    // 🔄 Sync server mỗi 30s (thay vì 5s)
+    syncTimer = setInterval(syncKeys, 30000);
+    setInterval(loadBypassLog, 15000);
   }
 })();
 
+// ============================================================
+// COUNTDOWN HELPERS
+// ============================================================
+function formatCountdown(ms) {
+  if (ms <= 0) return '00s';
+  const totalSec = Math.floor(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+
+  // Đệm 0 cho đẹp
+  const pad = n => String(n).padStart(2, '0');
+
+  if (h > 0) return pad(h) + 'h' + pad(m) + 'm' + pad(s) + 's';
+  if (m > 0) return pad(m) + 'm' + pad(s) + 's';
+  return pad(s) + 's';
+}
+
+function updateCountdowns() {
+  const now = Date.now();
+  const tb = document.querySelector('#tbl tbody');
+  if (!tb) return;
+
+  const rows = tb.querySelectorAll('tr[data-key]');
+  rows.forEach(row => {
+    const key = row.getAttribute('data-key');
+    const entry = keysData.find(k => k.key === key);
+    if (!entry) return;
+
+    const remain = entry.expireAt - now;
+    const remainCell = row.querySelector('.r');
+
+    if (remain <= 0) {
+      // Hết hạn → fade out rồi xóa
+      if (!row.classList.contains('row-expiring')) {
+        row.classList.add('row-expiring');
+        remainCell.textContent = '00s';
+        setTimeout(() => {
+          row.remove();
+          keysData = keysData.filter(k => k.key !== key);
+          // Nếu rỗng → hiện empty
+          if (keysData.length === 0) {
+            renderKeysTable([]);
+          }
+        }, 1000);
+      }
+      return;
+    }
+
+    remainCell.textContent = formatCountdown(remain);
+  });
+}
+
+// ============================================================
+// SYNC + RENDER
+// ============================================================
+async function syncKeys() {
+  try {
+    const r = await fetch('/api/list-keys', {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) return;
+    keysData = j.keys;
+    renderKeysTable(keysData);
+  } catch (e) {
+    console.error('sync error', e);
+  }
+}
+
+function renderKeysTable(list) {
+  const tb = document.querySelector('#tbl tbody');
+  if (!tb) return;
+
+  if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="4" style="color:#444;text-align:center">empty</td></tr>';
+    return;
+  }
+
+  // Build lại bảng
+  tb.innerHTML = '';
+  const now = Date.now();
+
+  list.forEach(k => {
+    const remain = k.expireAt - now;
+    if (remain <= 0) return; // bỏ qua key đã hết hạn
+
+    const tr = document.createElement('tr');
+    tr.setAttribute('data-key', k.key);
+
+    const tdKey = document.createElement('td');
+    tdKey.className = 'k';
+    tdKey.textContent = k.key;
+
+    const tdRemain = document.createElement('td');
+    tdRemain.className = 'r';
+    tdRemain.textContent = formatCountdown(remain);
+
+    const tdExpire = document.createElement('td');
+    tdExpire.style.fontSize = '11px';
+    tdExpire.style.color = '#8791a6';
+    tdExpire.textContent = k.expire;
+
+    const tdDel = document.createElement('td');
+    const btn = document.createElement('button');
+    btn.className = 'del';
+    btn.textContent = 'X';
+    btn.onclick = async () => {
+      await fetch('/api/delete-key', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({key: k.key})
+      });
+      keysData = keysData.filter(x => x.key !== k.key);
+      renderKeysTable(keysData);
+    };
+    tdDel.appendChild(btn);
+
+    tr.appendChild(tdKey);
+    tr.appendChild(tdRemain);
+    tr.appendChild(tdExpire);
+    tr.appendChild(tdDel);
+    tb.appendChild(tr);
+  });
+}
+
+// ============================================================
+// GET KEY / MENU
+// ============================================================
 function toggleMenu() {
   const m = document.getElementById('durationMenu');
   const btn = document.getElementById('getKeyBtn');
@@ -517,6 +875,7 @@ async function startTask(duration) {
   const status = document.getElementById('getKeyStatus');
   status.style.display = 'block';
   status.textContent = 'Starting...';
+  status.style.color = '#888';
 
   const r = await fetch('/api/start-task', {
     method: 'POST',
@@ -526,7 +885,7 @@ async function startTask(duration) {
   const j = await r.json();
 
   if (!j.ok) {
-    status.textContent = 'Error: ' + (j.message || 'unknown');
+    status.textContent = 'Error: ' + (j.reason || j.message || 'unknown');
     status.style.color = '#ef4444';
     return;
   }
@@ -537,6 +896,9 @@ async function startTask(duration) {
   location.href = j.taskUrl;
 }
 
+// ============================================================
+// CREATE KEY
+// ============================================================
 function showMsg(t, ok) {
   const m = document.getElementById('msg');
   m.textContent = t;
@@ -558,36 +920,41 @@ async function createKey() {
     body: JSON.stringify({content, hours, minutes, seconds})
   });
   const j = await r.json();
-  if (j.ok) { showMsg('OK ' + j.key, true); loadKeys(); }
-  else showMsg('FAIL', false);
+  if (j.ok) {
+    showMsg('OK ' + j.key, true);
+    // Thêm ngay vào list local để countdown chạy tức thì
+    keysData.push({
+      key: j.key,
+      expireAt: j.expireAt,
+      expire: j.expire
+    });
+    renderKeysTable(keysData);
+  } else {
+    showMsg('FAIL', false);
+  }
 }
 
-async function loadKeys() {
-  const r = await fetch('/api/list-keys', {method:'POST'});
-  const j = await r.json();
-  const tb = document.querySelector('#tbl tbody');
-  tb.innerHTML = '';
-  if (!j.ok || !j.keys.length) {
-    tb.innerHTML = '<tr><td colspan="4" style="color:#444;text-align:center">empty</td></tr>';
-    return;
-  }
-  j.keys.forEach(k => {
-    const tr = document.createElement('tr');
-    tr.innerHTML = '<td class="k">' + k.key + '</td><td class="r">' + k.remaining + '</td><td>' + k.expire + '</td>';
-    const td = document.createElement('td');
-    const b = document.createElement('button');
-    b.className = 'del'; b.textContent = 'X';
-    b.onclick = async () => {
-      await fetch('/api/delete-key', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({key: k.key})
-      });
-      loadKeys();
-    };
-    td.appendChild(b); tr.appendChild(td);
-    tb.appendChild(tr);
-  });
+// ============================================================
+// BYPASS LOG
+// ============================================================
+async function loadBypassLog() {
+  try {
+    const r = await fetch('/api/bypass-log', {method:'POST'});
+    const j = await r.json();
+    const box = document.getElementById('bypassLogList');
+    if (!j.ok || !j.logs.length) {
+      box.innerHTML = '<div style="color:#444;text-align:center;font-size:11px">No bypass yet</div>';
+      return;
+    }
+    box.innerHTML = j.logs.map(log => {
+      return '<div class="log-item">' +
+        '<div class="bad">⛔ IP: ' + log.ip + '</div>' +
+        '<div>' + log.duration.toUpperCase() + ' · Step ' + log.step + '/' + log.total + ' · ' + log.type + '</div>' +
+        '<div>' + log.reasons.join('<br>') + '</div>' +
+        '<div class="meta">' + log.time + ' · ' + log.elapsed + '</div>' +
+        '</div>';
+    }).join('');
+  } catch (e) {}
 }
 </script>
 </body></html>`;
@@ -665,7 +1032,7 @@ button:disabled{background:#232838;color:var(--text-faint);box-shadow:none;curso
 .err{color:var(--red)}
 .bypass-box{background:rgba(255,93,108,.08);border:1px solid rgba(255,93,108,.35);border-radius:16px;padding:22px;margin:20px 0;text-align:center}
 .bypass-box h3{font-family:'Sora',sans-serif;font-size:15px;margin-bottom:10px;color:var(--red)}
-.bypass-box p{font-size:12.5px;color:#ffb3ba;line-height:1.6}
+.bypass-box p{font-size:12.5px;color:#ffb3ba;line-height:1.6;word-break:break-word}
 .homebtn{background:linear-gradient(135deg,#a89bff,var(--violet));color:#fff;box-shadow:0 10px 24px -10px rgba(138,124,255,.5)}
 .foot-credit{color:var(--text-faint);font-size:10.5px;text-align:center;margin-top:18px;letter-spacing:.3px}
 </style>
@@ -689,7 +1056,6 @@ async function refresh() {
   const j = await r.json();
   if (!j.ok) return showError('Invalid task');
 
-  // Nếu bị bypass → hiện thông báo
   if (j.bypassed) {
     document.getElementById('sub').innerHTML = '';
     document.getElementById('progress').innerHTML = '';
