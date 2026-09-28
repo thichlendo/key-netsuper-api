@@ -49,8 +49,7 @@ const RATE_LIMIT_WINDOW = 60 * 60 * 1000;
 const RATE_LIMIT_MAX = 5;
 const MAX_BULK = 10000;
 
-// Key vĩnh viễn dùng TTL rất lớn (10 năm)
-const PERMANENT_TTL_SEC = 10 * 365 * 24 * 3600; // 10 năm
+const PERMANENT_TTL_SEC = 10 * 365 * 24 * 3600;
 const PERMANENT_EXPIRE_AT = () => Date.now() + PERMANENT_TTL_SEC * 1000;
 
 // ============================================
@@ -85,18 +84,27 @@ async function redisPipeline(commands) {
     } catch (e) { console.error('Pipeline err:', e.message); return null; }
 }
 
-async function saveKeyToRedis(key, expireAt) {
+// 💾 Save key với maxDevices
+async function saveKeyToRedis(key, expireAt, maxDevices = 0) {
     const ttl = Math.max(1, Math.ceil((expireAt - Date.now()) / 1000));
-    const value = JSON.stringify({ hwid: '', createdAt: Date.now() });
+    const value = JSON.stringify({
+        hwids: [],
+        maxDevices: Number(maxDevices) || 0,
+        createdAt: Date.now()
+    });
     return await redisPipeline([
         ['SET', `ns:key:${key}`, value, 'EX', String(ttl)],
         ['HSET', 'ns:meta', key, String(expireAt)]
     ]);
 }
 
-async function saveManyKeysToRedis(keysList, expireAt) {
+async function saveManyKeysToRedis(keysList, expireAt, maxDevices = 0) {
     const ttl = Math.max(1, Math.ceil((expireAt - Date.now()) / 1000));
-    const value = JSON.stringify({ hwid: '', createdAt: Date.now() });
+    const value = JSON.stringify({
+        hwids: [],
+        maxDevices: Number(maxDevices) || 0,
+        createdAt: Date.now()
+    });
     const batchSize = 100;
     const total = keysList.length;
     for (let i = 0; i < total; i += batchSize) {
@@ -115,6 +123,15 @@ async function getKeyFromRedis(key) {
     const value = await redis('GET', `ns:key:${key}`);
     if (!value) return null;
     try { return JSON.parse(value); } catch (e) { return {}; }
+}
+
+async function saveKeyEntry(key, entry) {
+    const ttl = await redis('TTL', `ns:key:${key}`);
+    if (ttl && ttl > 0) {
+        await redis('SET', `ns:key:${key}`, JSON.stringify(entry), 'EX', String(ttl));
+        return true;
+    }
+    return false;
 }
 
 async function deleteKeyFromRedis(key) {
@@ -260,8 +277,6 @@ async function genShortLink(type, cb) {
     return null;
 }
 
-// ⏱️ Tính expire từ object thời gian
-// { years, months, days, hours, minutes, seconds, permanent }
 function calcExpire(t) {
     if (t.permanent) {
         return { expireAt: PERMANENT_EXPIRE_AT(), isPermanent: true };
@@ -285,7 +300,7 @@ function calcExpire(t) {
 }
 
 function totalHoursOf(t) {
-    if (t.permanent) return 87600; // coi như 10 năm cho step calculation
+    if (t.permanent) return 87600;
     const years   = Number(t.years)   || 0;
     const months  = Number(t.months)  || 0;
     const days    = Number(t.days)    || 0;
@@ -296,24 +311,46 @@ function totalHoursOf(t) {
 }
 
 // ============================================
-// API: check-key
+// API: check-key — CÓ CHECK HWID LIMIT
 // ============================================
 app.get('/api/check-key', async (req, res) => {
     const key = req.query.key;
-    const hwid = req.query.hwid || '';
+    const hwid = String(req.query.hwid || '').trim();
+
     if (!key) return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
+
     const entry = await getKeyFromRedis(key);
     if (!entry) return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
-    if (!entry.hwid) {
-        entry.hwid = hwid;
-        const ttl = await redis('TTL', `ns:key:${key}`);
-        if (ttl && ttl > 0) await redis('SET', `ns:key:${key}`, JSON.stringify(entry), 'EX', String(ttl));
-    } else if (entry.hwid !== hwid && hwid) {
-        return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
+
+    // Init hwids
+    if (!Array.isArray(entry.hwids)) {
+        entry.hwids = entry.hwid ? [entry.hwid] : [];
     }
+    const maxDevices = Number(entry.maxDevices) || 0;
+
+    // Check HWID
+    if (hwid) {
+        if (entry.hwids.includes(hwid)) {
+            // Known device — OK
+        } else if (maxDevices === 0 || entry.hwids.length < maxDevices) {
+            // Add new device
+            entry.hwids.push(hwid);
+            await saveKeyEntry(key, entry);
+        } else {
+            // Over device limit
+            return res.json({
+                p: JSON.stringify({ ok: 0, reason: 'device_limit', max: maxDevices, used: entry.hwids.length }),
+                s: 'x'
+            });
+        }
+    }
+
     const ttl = await redis('TTL', `ns:key:${key}`);
-    const exp = (ttl && ttl > 0) ? Math.floor((Date.now() + ttl * 1000) / 1000) : Math.floor(Date.now()/1000) + 3600;
-    return res.json({ p: JSON.stringify({ ok: 1, exp }), s: 'x' });
+    const exp = (ttl && ttl > 0)
+        ? Math.floor((Date.now() + ttl * 1000) / 1000)
+        : Math.floor(Date.now() / 1000) + 3600;
+
+    return res.json({ p: JSON.stringify({ ok: 1, exp, maxDevices, devices: entry.hwids.length }), s: 'x' });
 });
 
 // ============================================
@@ -337,7 +374,8 @@ app.post('/api/start-task', (req, res) => {
         clientIP, clientUA: req.headers['user-agent'] || '',
         isAdmin: isAdminIP(req),
         stepStartedAt: 0, stepIP: '', stepUA: '',
-        bypassed: false, bypassReason: null, callbackHistory: []
+        bypassed: false, bypassReason: null, callbackHistory: [],
+        maxDevices: 0
     });
     logIPTask(clientIP);
     setTimeout(() => tasks.delete(token), 30 * 60 * 1000);
@@ -412,7 +450,7 @@ app.get('/api/step-callback', async (req, res) => {
     if (task.completedSteps >= task.totalSteps) {
         const key = genKey();
         const expireAt = Date.now() + task.hours * 3600 * 1000;
-        await saveKeyToRedis(key, expireAt);
+        await saveKeyToRedis(key, expireAt, task.maxDevices || 0);
         task.key = key;
         task.keyExpire = vnTime(new Date(expireAt));
         task.done = true;
@@ -428,16 +466,17 @@ app.post('/api/verify-admin', (req, res) => {
     return res.json({ isAdmin: isAdmin(req) });
 });
 
-// Tạo 1 key với content tùy chỉnh
 app.post('/api/create-key', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
-    const { content, time } = req.body;
+    const { content, time, maxDevices } = req.body;
     if (!content) return res.json({ ok: false, message: 'no_content' });
 
     const calc = calcExpire(time || {});
     if (!calc) return res.json({ ok: false, message: 'bad_time' });
 
-    await saveKeyToRedis(content, calc.expireAt);
+    const maxDev = Math.max(0, Number(maxDevices) || 0);
+
+    await saveKeyToRedis(content, calc.expireAt, maxDev);
 
     const totalHours = totalHoursOf(time || {});
     const steps = stepsForHours(totalHours);
@@ -448,20 +487,21 @@ app.post('/api/create-key', async (req, res) => {
         expireAt: calc.expireAt,
         expire: calc.isPermanent ? 'VĨNH VIỄN' : vnTime(new Date(calc.expireAt)),
         isPermanent: calc.isPermanent,
+        maxDevices: maxDev,
         steps
     });
 });
 
-// Tạo 1 key nhanh theo duration preset
 app.post('/api/quick-create', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
-    const { duration } = req.body;
+    const { duration, maxDevices } = req.body;
     const config = DURATION_CONFIG[duration];
     if (!config) return res.json({ ok: false });
 
+    const maxDev = Math.max(0, Number(maxDevices) || 0);
     const key = genKey();
     const expireAt = Date.now() + config.hours * 3600 * 1000;
-    await saveKeyToRedis(key, expireAt);
+    await saveKeyToRedis(key, expireAt, maxDev);
 
     return res.json({
         ok: true,
@@ -470,32 +510,32 @@ app.post('/api/quick-create', async (req, res) => {
         hours: config.hours,
         expireAt,
         expire: vnTime(new Date(expireAt)),
+        maxDevices: maxDev,
         steps: config.steps
     });
 });
 
-// ⭐ Bulk create với time tùy chỉnh
 app.post('/api/bulk-create', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
-    const { count, time, mode, duration } = req.body;
+    const { count, time, mode, duration, maxDevices } = req.body;
 
     let n = parseInt(count, 10) || 1;
     if (n < 1) n = 1;
     if (n > MAX_BULK) n = MAX_BULK;
+
+    const maxDev = Math.max(0, Number(maxDevices) || 0);
 
     let calc;
     let steps;
     let label;
 
     if (mode === 'preset') {
-        // Dùng preset duration
         const config = DURATION_CONFIG[duration];
         if (!config) return res.json({ ok: false, message: 'bad_duration' });
         calc = { expireAt: Date.now() + config.hours * 3600 * 1000, isPermanent: false };
         steps = config.steps;
         label = duration.toUpperCase();
     } else {
-        // Custom time
         calc = calcExpire(time || {});
         if (!calc) return res.json({ ok: false, message: 'bad_time' });
         const totalHours = totalHoursOf(time || {});
@@ -506,7 +546,7 @@ app.post('/api/bulk-create', async (req, res) => {
     const keysList = [];
     for (let i = 0; i < n; i++) keysList.push(genKey());
 
-    await saveManyKeysToRedis(keysList, calc.expireAt);
+    await saveManyKeysToRedis(keysList, calc.expireAt, maxDev);
 
     return res.json({
         ok: true,
@@ -515,6 +555,7 @@ app.post('/api/bulk-create', async (req, res) => {
         expireAt: calc.expireAt,
         expire: calc.isPermanent ? 'VĨNH VIỄN' : vnTime(new Date(calc.expireAt)),
         isPermanent: calc.isPermanent,
+        maxDevices: maxDev,
         keys: keysList,
         steps
     });
@@ -526,16 +567,33 @@ app.post('/api/delete-key', async (req, res) => {
     return res.json({ ok: true });
 });
 
+// ⭐ List keys + kèm info devices
 app.post('/api/list-keys', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
     const list = await listKeysFromRedis();
-    const out = list.map(v => ({
-        key: v.key,
-        expireAt: v.expireAt,
-        expire: (v.expireAt - Date.now() > PERMANENT_TTL_SEC * 1000 - 86400000)
-            ? 'VĨNH VIỄN'
-            : vnTime(new Date(v.expireAt))
-    }));
+
+    const out = [];
+    for (const v of list) {
+        let maxDev = 0;
+        let usedDev = 0;
+        try {
+            const entry = await getKeyFromRedis(v.key);
+            if (entry) {
+                maxDev = Number(entry.maxDevices) || 0;
+                usedDev = Array.isArray(entry.hwids) ? entry.hwids.length : (entry.hwid ? 1 : 0);
+            }
+        } catch (e) {}
+
+        out.push({
+            key: v.key,
+            expireAt: v.expireAt,
+            expire: (v.expireAt - Date.now() > PERMANENT_TTL_SEC * 1000 - 86400000)
+                ? 'VĨNH VIỄN'
+                : vnTime(new Date(v.expireAt)),
+            maxDevices: maxDev,
+            devices: usedDev
+        });
+    }
     return res.json({ ok: true, keys: out });
 });
 
@@ -625,6 +683,14 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
 .permanent-box{display:flex;align-items:center;gap:8px;margin-top:10px;padding:10px;background:rgba(255,93,108,.08);border:1px solid rgba(255,93,108,.3);border-radius:10px;cursor:pointer}
 .permanent-box input[type="checkbox"]{width:auto;margin:0;transform:scale(1.3);accent-color:#ff5d6c}
 .permanent-box span{font-size:12px;color:#ff8e9c;font-weight:600}
+.device-box{background:rgba(138,124,255,.08);border:1px solid rgba(138,124,255,.3);border-radius:10px;padding:12px;margin-top:10px}
+.device-box label{color:#c7bfff;margin:0 0 8px}
+.device-radio{display:flex;gap:8px;margin-bottom:8px}
+.device-radio button{flex:1;padding:10px;font-size:12px;background:rgba(0,0,0,.3);color:var(--text-faint);border:1px solid var(--border);margin:0;font-weight:600}
+.device-radio button.active{background:rgba(138,124,255,.2);color:#c7bfff;border-color:#8a7cff}
+.device-radio button:hover{transform:none}
+.dev-count{color:#c7bfff;font-weight:600}
+td.dev{color:#c7bfff;font-family:'JetBrains Mono',monospace;font-size:11px}
 </style>
 </head><body>
 <div class="wrap">
@@ -681,8 +747,18 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
 <button onclick="pickPreset('12h')"><b>12H</b></button>
 <button class="wide" onclick="pickPreset('24h')"><b>24H</b></button>
 </div>
-<input type="hidden" id="presetPicked" value="">
 <div id="presetPickedLabel" style="text-align:center;font-size:11px;color:var(--text-faint);margin-top:8px"></div>
+</div>
+
+<div class="device-box">
+<label>📱 Giới hạn thiết bị</label>
+<div class="device-radio">
+<button id="devUnlimited" class="active" onclick="setDeviceMode('unlimited')">VÔ HẠN</button>
+<button id="devCustom" onclick="setDeviceMode('custom')">TÙY CHỈNH</button>
+</div>
+<div id="devCustomInput" style="display:none">
+<input id="maxDevices" type="number" value="1" min="1" placeholder="Số thiết bị">
+</div>
 </div>
 
 <button class="btn-green" onclick="createKey()">CREATE KEY</button>
@@ -713,10 +789,32 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
 <input type="checkbox" id="bulkPermanentChk">
 <span>🔒 VĨNH VIỄN (không hết hạn)</span>
 </div>
+
+<div class="device-box">
+<label>📱 Giới hạn thiết bị</label>
+<div class="device-radio">
+<button id="bDevUnlimited" class="active" onclick="setBulkDeviceMode('unlimited')">VÔ HẠN</button>
+<button id="bDevCustom" onclick="setBulkDeviceMode('custom')">TÙY CHỈNH</button>
+</div>
+<div id="bDevCustomInput" style="display:none">
+<input id="bulkMaxDevices" type="number" value="1" min="1" placeholder="Số thiết bị">
+</div>
+</div>
+
 <button class="btn-green" style="margin-top:10px" onclick="bulkCreateCustom()">⚡ TẠO HÀNG LOẠT</button>
 </div>
 
 <div id="bulkPresetTime" style="display:none">
+<div class="device-box">
+<label>📱 Giới hạn thiết bị</label>
+<div class="device-radio">
+<button id="bpDevUnlimited" class="active" onclick="setBulkPresetDeviceMode('unlimited')">VÔ HẠN</button>
+<button id="bpDevCustom" onclick="setBulkPresetDeviceMode('custom')">TÙY CHỈNH</button>
+</div>
+<div id="bpDevCustomInput" style="display:none">
+<input id="bulkPresetMaxDevices" type="number" value="1" min="1" placeholder="Số thiết bị">
+</div>
+</div>
 <div class="quick-grid">
 <button onclick="bulkCreatePreset('3h')"><b>3H</b><span>tạo hàng loạt</span></button>
 <button onclick="bulkCreatePreset('6h')"><b>6H</b><span>tạo hàng loạt</span></button>
@@ -735,10 +833,10 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
 <button class="btn-purple" style="margin-top:10px" onclick="copyAllResult()">📋 COPY ALL</button>
 </div>
 
-<table id="tbl"><thead><tr><th>KEY</th><th>REMAIN</th><th>EXPIRE</th><th></th></tr></thead><tbody></tbody></table>
+<table id="tbl"><thead><tr><th>KEY</th><th>REMAIN</th><th>DEVICES</th><th>EXPIRE</th><th></th></tr></thead><tbody></tbody></table>
 </div>
 
-<div class="hint">✦ Crafted by ThichLenDo · v3.1 ✦</div>
+<div class="hint">✦ Crafted by ThichLenDo · v3.2 ✦</div>
 </div>
 
 <script>
@@ -747,6 +845,9 @@ let lastResult = null;
 let currentTab = 'manual';
 let currentBulkTab = 'manual';
 let presetDuration = '';
+let deviceMode = 'unlimited';
+let bulkDeviceMode = 'unlimited';
+let bulkPresetDeviceMode = 'unlimited';
 const MAX_SHOW_KEYS = 20;
 
 (async () => {
@@ -811,7 +912,7 @@ async function syncKeys() {
 function renderKeysTable(list) {
   const tb = document.querySelector('#tbl tbody');
   if (!tb) return;
-  if (!list.length) { tb.innerHTML = '<tr><td colspan="4" style="color:#444;text-align:center">empty</td></tr>'; return; }
+  if (!list.length) { tb.innerHTML = '<tr><td colspan="5" style="color:#444;text-align:center">empty</td></tr>'; return; }
   tb.innerHTML = '';
   const now = Date.now();
   list.forEach(k => {
@@ -819,7 +920,10 @@ function renderKeysTable(list) {
     if (remain <= 0) return;
     const tr = document.createElement('tr');
     tr.setAttribute('data-key', k.key);
-    tr.innerHTML = '<td class="k">'+k.key+'</td><td class="r">'+formatCountdown(remain)+'</td><td style="font-size:11px;color:#8791a6">'+k.expire+'</td>';
+    const dev = (Number(k.maxDevices)||0) === 0
+      ? (k.devices||0) + '/∞'
+      : (k.devices||0) + '/' + k.maxDevices;
+    tr.innerHTML = '<td class="k">'+k.key+'</td><td class="r">'+formatCountdown(remain)+'</td><td class="dev">'+dev+'</td><td style="font-size:11px;color:#8791a6">'+k.expire+'</td>';
     const td = document.createElement('td');
     const b = document.createElement('button');
     b.className = 'del'; b.textContent = 'X';
@@ -873,6 +977,24 @@ function toggleBulkPermanent() {
   const chk = document.getElementById('bulkPermanentChk');
   chk.checked = !chk.checked;
 }
+function setDeviceMode(m) {
+  deviceMode = m;
+  document.getElementById('devUnlimited').classList.toggle('active', m === 'unlimited');
+  document.getElementById('devCustom').classList.toggle('active', m === 'custom');
+  document.getElementById('devCustomInput').style.display = m === 'custom' ? 'block' : 'none';
+}
+function setBulkDeviceMode(m) {
+  bulkDeviceMode = m;
+  document.getElementById('bDevUnlimited').classList.toggle('active', m === 'unlimited');
+  document.getElementById('bDevCustom').classList.toggle('active', m === 'custom');
+  document.getElementById('bDevCustomInput').style.display = m === 'custom' ? 'block' : 'none';
+}
+function setBulkPresetDeviceMode(m) {
+  bulkPresetDeviceMode = m;
+  document.getElementById('bpDevUnlimited').classList.toggle('active', m === 'unlimited');
+  document.getElementById('bpDevCustom').classList.toggle('active', m === 'custom');
+  document.getElementById('bpDevCustomInput').style.display = m === 'custom' ? 'block' : 'none';
+}
 
 function getTimeObj(prefix) {
   return {
@@ -884,6 +1006,11 @@ function getTimeObj(prefix) {
     seconds: document.getElementById(prefix+'Sec').value || 0,
     permanent: document.getElementById(prefix === 't' ? 'permanentChk' : 'bulkPermanentChk').checked
   };
+}
+function getMaxDevices(mode, inputId) {
+  if (mode === 'unlimited') return 0;
+  const v = parseInt(document.getElementById(inputId).value, 10) || 1;
+  return Math.max(1, v);
 }
 
 function showMsg(t, ok) {
@@ -898,8 +1025,13 @@ function showResult(data) {
   const keyBox = document.getElementById('resultKey');
   const listBox = document.getElementById('resultKeysList');
 
+  const devInfo = (Number(data.maxDevices)||0) === 0
+    ? '📱 Vô hạn'
+    : '📱 ' + data.maxDevices + ' thiết bị';
+  const devTag = ' — ' + devInfo;
+
   if (data.keys && data.keys.length > 1) {
-    keyBox.textContent = '✅ ' + data.keys.length + ' KEYS ' + (data.label ? '[' + data.label + ']' : '');
+    keyBox.textContent = '✅ ' + data.keys.length + ' KEYS ' + (data.label ? '[' + data.label + ']' : '') + devTag;
     const show = data.keys.slice(0, MAX_SHOW_KEYS);
     let txt = show.join('\\n');
     if (data.keys.length > MAX_SHOW_KEYS) {
@@ -908,7 +1040,7 @@ function showResult(data) {
     listBox.textContent = txt;
     listBox.style.display = 'block';
   } else {
-    keyBox.textContent = data.key || (data.keys && data.keys[0]);
+    keyBox.textContent = (data.key || (data.keys && data.keys[0])) + devTag;
     listBox.style.display = 'none';
   }
 }
@@ -931,17 +1063,19 @@ async function createKey() {
     if (total <= 0) return showMsg('Chọn thời gian', false);
   }
 
+  const maxDevices = getMaxDevices(deviceMode, 'maxDevices');
+
   showMsg('Creating...', true);
   const r = await fetch('/api/create-key', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({content, time: timeObj})
+    body:JSON.stringify({content, time: timeObj, maxDevices})
   });
   const j = await r.json();
   if (j.ok) {
     showMsg('✅ OK', true);
-    showResult({ key: j.key, keys: [j.key], label: j.isPermanent ? 'VĨNH VIỄN' : '', expire: j.expire });
-    keysData.push({ key: j.key, expireAt: j.expireAt, expire: j.expire });
+    showResult({ key: j.key, keys: [j.key], label: j.isPermanent ? 'VĨNH VIỄN' : '', expire: j.expire, maxDevices: j.maxDevices });
+    keysData.push({ key: j.key, expireAt: j.expireAt, expire: j.expire, maxDevices: j.maxDevices, devices: 0 });
     renderKeysTable(keysData);
   } else showMsg('FAIL: ' + (j.message||''), false);
 }
@@ -958,17 +1092,19 @@ async function bulkCreateCustom() {
     if (total <= 0) return showMsg('Chọn thời gian', false);
   }
 
+  const maxDevices = getMaxDevices(bulkDeviceMode, 'bulkMaxDevices');
+
   showMsg('Đang tạo ' + count + ' key...', true);
   const r = await fetch('/api/bulk-create', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({count, time: timeObj, mode: 'custom'})
+    body:JSON.stringify({count, time: timeObj, mode: 'custom', maxDevices})
   });
   const j = await r.json();
   if (j.ok) {
     showMsg('✅ Đã tạo ' + j.count + ' key', true);
-    showResult({ keys: j.keys, label: j.label, expire: j.expire, count: j.count });
-    j.keys.forEach(k => keysData.push({ key: k, expireAt: j.expireAt, expire: j.expire }));
+    showResult({ keys: j.keys, label: j.label, expire: j.expire, count: j.count, maxDevices: j.maxDevices });
+    j.keys.forEach(k => keysData.push({ key: k, expireAt: j.expireAt, expire: j.expire, maxDevices: j.maxDevices, devices: 0 }));
     renderKeysTable(keysData);
     try { await navigator.clipboard.writeText(j.keys.join('\\n')); } catch (e) {}
   } else showMsg('FAIL: ' + (j.message||''), false);
@@ -979,17 +1115,19 @@ async function bulkCreatePreset(duration) {
   if (count < 1) return showMsg('Số lượng >= 1', false);
   if (count > 10000) return showMsg('Tối đa 10,000', false);
 
+  const maxDevices = getMaxDevices(bulkPresetDeviceMode, 'bulkPresetMaxDevices');
+
   showMsg('Đang tạo ' + count + ' key ' + duration.toUpperCase() + '...', true);
   const r = await fetch('/api/bulk-create', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({count, mode: 'preset', duration})
+    body:JSON.stringify({count, mode: 'preset', duration, maxDevices})
   });
   const j = await r.json();
   if (j.ok) {
     showMsg('✅ ' + j.count + ' key ' + duration.toUpperCase(), true);
-    showResult({ keys: j.keys, label: j.label, expire: j.expire, count: j.count });
-    j.keys.forEach(k => keysData.push({ key: k, expireAt: j.expireAt, expire: j.expire }));
+    showResult({ keys: j.keys, label: j.label, expire: j.expire, count: j.count, maxDevices: j.maxDevices });
+    j.keys.forEach(k => keysData.push({ key: k, expireAt: j.expireAt, expire: j.expire, maxDevices: j.maxDevices, devices: 0 }));
     renderKeysTable(keysData);
     try { await navigator.clipboard.writeText(j.keys.join('\\n')); } catch (e) {}
   } else showMsg('FAIL: ' + (j.message||''), false);
@@ -997,14 +1135,19 @@ async function bulkCreatePreset(duration) {
 
 function copyAllResult() {
   if (!lastResult) return;
+  const devInfo = (Number(lastResult.maxDevices)||0) === 0
+    ? '📱 Vô hạn'
+    : '📱 ' + lastResult.maxDevices + ' thiết bị';
   let txt = '';
   if (lastResult.keys && lastResult.keys.length > 1) {
     txt = '🔑 ' + lastResult.keys.length + ' KEYS ' + (lastResult.label ? '[' + lastResult.label + ']' : '') + '\\n';
-    txt += '⏱️ Expire: ' + lastResult.expire + '\\n\\n';
+    txt += '⏱️ Expire: ' + lastResult.expire + '\\n';
+    txt += devInfo + '\\n\\n';
     txt += lastResult.keys.join('\\n');
   } else {
     txt = '🔑 KEY: ' + (lastResult.key || lastResult.keys[0]) + '\\n';
     txt += '⏱️ Expire: ' + lastResult.expire + '\\n';
+    txt += devInfo + '\\n';
   }
   navigator.clipboard.writeText(txt).then(() => showMsg('✅ Copied!', true));
 }
