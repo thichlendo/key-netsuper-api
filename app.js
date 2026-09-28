@@ -164,6 +164,45 @@ const ipBlacklist = new Map();
 const ipTaskLog = new Map();
 
 // ============================================
+// SITE CONFIG (status: online / maintenance / off) + IP WHITELIST
+// ============================================
+let siteConfigCache = {
+    status: 'online',
+    maintMsg: 'Website đang được bảo trì. Vui lòng quay lại sau ít phút.',
+    offMsg: 'Website hiện đang tạm ngưng hoạt động.'
+};
+let whitelistCache = new Set();
+
+async function loadSiteConfig() {
+    const raw = await redis('GET', 'ns:site:config');
+    if (raw) {
+        try { siteConfigCache = { ...siteConfigCache, ...JSON.parse(raw) }; }
+        catch (e) {}
+    }
+}
+async function saveSiteConfig(patch) {
+    siteConfigCache = { ...siteConfigCache, ...patch };
+    await redis('SET', 'ns:site:config', JSON.stringify(siteConfigCache));
+    return siteConfigCache;
+}
+async function loadWhitelist() {
+    const members = await redis('SMEMBERS', 'ns:site:whitelist');
+    if (Array.isArray(members)) whitelistCache = new Set(members);
+}
+async function addWhitelistIP(ip) {
+    whitelistCache.add(ip);
+    await redis('SADD', 'ns:site:whitelist', ip);
+}
+async function removeWhitelistIP(ip) {
+    whitelistCache.delete(ip);
+    await redis('SREM', 'ns:site:whitelist', ip);
+}
+function isWhitelistedIP(ip) { return whitelistCache.has(ip); }
+// Load persisted config/whitelist once Redis is reachable
+loadSiteConfig();
+loadWhitelist();
+
+// ============================================
 // HELPERS
 // ============================================
 function vnTime(d) {
@@ -176,7 +215,10 @@ function getClientIP(req) {
     if (fwd) return String(fwd).split(',')[0].trim();
     return req.ip || '';
 }
-function isAdminIP(req) { return ADMIN_IPS.includes(getClientIP(req)); }
+function isAdminIP(req) {
+    const ip = getClientIP(req);
+    return ADMIN_IPS.includes(ip) || isWhitelistedIP(ip);
+}
 function isAdmin(req) {
     const ip = getClientIP(req);
     const serial = (req.body && req.body.serial) || req.query.serial;
@@ -437,6 +479,52 @@ app.get('/api/step-callback', async (req, res) => {
 // ============================================
 app.post('/api/verify-admin', (req, res) => res.json({ isAdmin: isAdmin(req) }));
 
+// ---- Site status (public read) ----
+app.get('/api/site-status', (req, res) => {
+    const admin = isAdmin(req);
+    const payload = {
+        ok: true,
+        status: siteConfigCache.status,
+        message: siteConfigCache.status === 'maintenance' ? siteConfigCache.maintMsg
+               : siteConfigCache.status === 'off' ? siteConfigCache.offMsg : '',
+        isAdmin: admin
+    };
+    if (admin) { payload.maintMsg = siteConfigCache.maintMsg; payload.offMsg = siteConfigCache.offMsg; }
+    res.json(payload);
+});
+
+// ---- Site status (admin write) ----
+app.post('/api/site-status', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
+    const { status, maintMsg, offMsg } = req.body;
+    const patch = {};
+    if (status && ['online', 'maintenance', 'off'].includes(status)) patch.status = status;
+    if (typeof maintMsg === 'string') patch.maintMsg = maintMsg;
+    if (typeof offMsg === 'string') patch.offMsg = offMsg;
+    const cfg = await saveSiteConfig(patch);
+    return res.json({ ok: true, config: cfg });
+});
+
+// ---- IP whitelist (admin) ----
+app.post('/api/whitelist-add', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
+    const ip = String(req.body.ip || '').trim();
+    if (!ip) return res.json({ ok: false, message: 'no_ip' });
+    await addWhitelistIP(ip);
+    return res.json({ ok: true, ip });
+});
+app.post('/api/whitelist-remove', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
+    const ip = String(req.body.ip || '').trim();
+    if (!ip) return res.json({ ok: false, message: 'no_ip' });
+    await removeWhitelistIP(ip);
+    return res.json({ ok: true, ip });
+});
+app.post('/api/whitelist-list', (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
+    return res.json({ ok: true, ips: Array.from(whitelistCache), yourIp: getClientIP(req) });
+});
+
 app.post('/api/create-key', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
     const { content, time, maxDevices } = req.body;
@@ -558,7 +646,17 @@ app.get('/api/health', async (req, res) => {
 // ============================================
 // ROUTES
 // ============================================
-app.get('/', (req, res) => res.send(MAIN_HTML));
+function serveMainOrMaintenance(req, res) {
+    if (siteConfigCache.status !== 'online' && !isAdmin(req)) {
+        const msg = siteConfigCache.status === 'off' ? siteConfigCache.offMsg : siteConfigCache.maintMsg;
+        return res.send(renderMaintenancePage(siteConfigCache.status, msg));
+    }
+    return res.send(MAIN_HTML);
+}
+app.get('/', serveMainOrMaintenance);
+app.get('/getkey', serveMainOrMaintenance);
+// Hidden admin entrance — always reaches the full page (with admin panel JS-gated) regardless of site status
+app.get('/amin/thichlendo', (req, res) => res.send(MAIN_HTML));
 app.get('/task', (req, res) => res.send(renderTaskPage(req.query.token || '')));
 
 // ============================================
@@ -940,6 +1038,42 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--cyan);outline-o
   background:rgba(251,113,133,.12);
   border:1px solid rgba(251,113,133,.38);
   box-shadow:0 0 22px -6px rgba(251,113,133,.6);
+}
+
+/* ---------- SERVER STATUS DOT (blinking) ---------- */
+.status-dot{
+  display:inline-flex;
+  align-items:center;
+  gap:7px;
+  padding:6px 13px;
+  border-radius:999px;
+  font-family:var(--font-mono);
+  font-size:10.5px;
+  font-weight:700;
+  letter-spacing:.5px;
+  backdrop-filter:blur(12px);
+  -webkit-backdrop-filter:blur(12px);
+  transition:background .25s var(--ease),border-color .25s var(--ease),color .25s var(--ease);
+}
+.status-dot i{
+  width:8px;height:8px;border-radius:50%;flex:none;
+  animation:dot-blink 1.4s ease-in-out infinite;
+}
+.status-dot.online{
+  color:var(--emerald);
+  background:rgba(52,211,153,.12);
+  border:1px solid rgba(52,211,153,.4);
+}
+.status-dot.online i{background:var(--emerald);box-shadow:0 0 10px 2px rgba(52,211,153,.8)}
+.status-dot.maintenance{
+  color:var(--rose);
+  background:rgba(251,113,133,.12);
+  border:1px solid rgba(251,113,133,.4);
+}
+.status-dot.maintenance i{background:var(--rose);box-shadow:0 0 10px 2px rgba(251,113,133,.85)}
+@keyframes dot-blink{
+  0%,100%{opacity:1;transform:scale(1)}
+  50%{opacity:.25;transform:scale(.7)}
 }
 
 /* ---------- FOOTER ---------- */
@@ -1815,7 +1949,10 @@ ${THEME_BG}
 <span class="brand-mark">${THEME_LOGO}</span>
 <span class="brand-name">ThichLenDo</span>
 </a>
+<span style="display:flex;gap:8px;align-items:center">
+<span id="statusDot" class="status-dot online"><i></i>ONLINE</span>
 <span id="redisBadge"></span>
+</span>
 </header>
 
 <main class="wrap">
@@ -1880,6 +2017,26 @@ ${THEME_BG}
 </div>
 <span class="tag">ADMIN</span>
 </div>
+
+<div class="section-title">QUẢN LÝ SERVER</div>
+<div class="device-radio" style="margin-bottom:10px">
+<button id="siteStatusOnline" class="active" onclick="setSiteStatus('online')">🟢 ONLINE</button>
+<button id="siteStatusMaint" onclick="setSiteStatus('maintenance')">🟡 BẢO TRÌ</button>
+<button id="siteStatusOff" onclick="setSiteStatus('off')">🔴 TẮT WEB</button>
+</div>
+<label>Nội dung khi Bảo trì</label>
+<textarea id="maintMsgInput" rows="2" style="width:100%;resize:vertical;font-family:var(--font-body);padding:11px 13px;border-radius:var(--radius-md);background:var(--field);border:1px solid var(--line);color:var(--text)"></textarea>
+<label style="margin-top:10px;display:block">Nội dung khi Tắt web</label>
+<textarea id="offMsgInput" rows="2" style="width:100%;resize:vertical;font-family:var(--font-body);padding:11px 13px;border-radius:var(--radius-md);background:var(--field);border:1px solid var(--line);color:var(--text)"></textarea>
+<button class="btn-purple" style="margin-top:10px" onclick="saveSiteMessages()">LƯU NỘI DUNG</button>
+<p class="card-sub" style="margin-top:8px">Get Key và Admin luôn truy cập bình thường dù bảo trì / tắt web. Người dùng thường sẽ thấy trang thông báo tương ứng.</p>
+
+<div class="section-title">IP WHITELIST (quyền admin)</div>
+<div style="display:flex;gap:8px">
+<input id="whitelistIpInput" placeholder="VD: 171.237.204.101" style="flex:1">
+<button class="btn-green" style="margin-top:0" onclick="addWhitelistIp()">THÊM</button>
+</div>
+<div id="whitelistList" style="margin-top:10px"></div>
 
 <label>Key Content</label>
 <input id="content" placeholder="VIP-ABC">
@@ -2049,16 +2206,100 @@ const MAX_SHOW_KEYS = 20;
   } catch (e) {}
 })();
 
+async function refreshStatusDot() {
+  try {
+    const r = await fetch('/api/site-status');
+    const j = await r.json();
+    const dot = document.getElementById('statusDot');
+    if (!dot) return;
+    if (j.status === 'online') {
+      dot.className = 'status-dot online';
+      dot.innerHTML = '<i></i>ONLINE';
+    } else {
+      dot.className = 'status-dot maintenance';
+      dot.innerHTML = '<i></i>' + (j.status === 'off' ? 'OFF' : 'BẢO TRÌ');
+    }
+  } catch (e) {}
+}
+refreshStatusDot();
+setInterval(refreshStatusDot, 15000);
+
 (async () => {
   const r = await fetch('/api/verify-admin', {method:'POST'});
   const j = await r.json();
   if (j.isAdmin) {
     document.getElementById('adminPanel').style.display = 'block';
     await syncKeys();
+    await loadSiteConfigForAdmin();
+    await syncWhitelist();
     setInterval(updateCountdowns, 1000);
     setInterval(syncKeys, 30000);
   }
 })();
+
+async function loadSiteConfigForAdmin() {
+  try {
+    const r = await fetch('/api/site-status');
+    const j = await r.json();
+    setSiteStatusButtons(j.status);
+    document.getElementById('maintMsgInput').value = j.maintMsg || '';
+    document.getElementById('offMsgInput').value = j.offMsg || '';
+  } catch (e) {}
+}
+function setSiteStatusButtons(status) {
+  document.getElementById('siteStatusOnline').classList.toggle('active', status === 'online');
+  document.getElementById('siteStatusMaint').classList.toggle('active', status === 'maintenance');
+  document.getElementById('siteStatusOff').classList.toggle('active', status === 'off');
+}
+async function setSiteStatus(status) {
+  setSiteStatusButtons(status);
+  const r = await fetch('/api/site-status', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status})});
+  const j = await r.json();
+  if (j.ok) { showMsg('Đã cập nhật trạng thái server: ' + status.toUpperCase(), true); refreshStatusDot(); }
+  else showMsg('Lỗi cập nhật trạng thái', false);
+}
+async function saveSiteMessages() {
+  const maintMsg = document.getElementById('maintMsgInput').value;
+  const offMsg = document.getElementById('offMsgInput').value;
+  const r = await fetch('/api/site-status', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({maintMsg, offMsg})});
+  const j = await r.json();
+  showMsg(j.ok ? 'Đã lưu nội dung thông báo' : 'Lỗi lưu nội dung', !!j.ok);
+}
+async function syncWhitelist() {
+  try {
+    const r = await fetch('/api/whitelist-list', {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) return;
+    renderWhitelist(j.ips, j.yourIp);
+  } catch (e) {}
+}
+function renderWhitelist(ips, yourIp) {
+  const box = document.getElementById('whitelistList');
+  if (!ips.length) { box.innerHTML = '<p class="card-sub">Chưa có IP nào trong whitelist</p>'; return; }
+  box.innerHTML = '';
+  ips.forEach(ip => {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;margin-top:6px;border-radius:10px;background:var(--field);border:1px solid var(--line);font-family:var(--font-mono);font-size:12.5px';
+    row.innerHTML = '<span>' + ip + (ip === yourIp ? ' <span style="color:var(--emerald)">(bạn)</span>' : '') + '</span>';
+    const btn = document.createElement('button');
+    btn.className = 'del'; btn.textContent = 'X';
+    btn.onclick = async () => {
+      await fetch('/api/whitelist-remove', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})});
+      syncWhitelist();
+    };
+    row.appendChild(btn);
+    box.appendChild(row);
+  });
+}
+async function addWhitelistIp() {
+  const input = document.getElementById('whitelistIpInput');
+  const ip = input.value.trim();
+  if (!ip) return;
+  const r = await fetch('/api/whitelist-add', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip})});
+  const j = await r.json();
+  if (j.ok) { input.value = ''; showMsg('Đã thêm IP admin: ' + ip, true); syncWhitelist(); }
+  else showMsg('Lỗi thêm IP', false);
+}
 
 function formatCountdown(ms) {
   if (ms <= 0) return '00s';
@@ -2520,6 +2761,59 @@ a.pill:hover{
 }
 `;
 
+const MAINTENANCE_CSS = `
+.maint-wrap{max-width:520px;margin:0 auto;padding:60px 20px 40px;position:relative;z-index:1}
+.maint-card{
+  padding:38px 28px;
+  border-radius:var(--radius-xl);
+  background:var(--glass-strong);
+  border:1px solid var(--line-strong);
+  backdrop-filter:blur(20px);
+  text-align:center;
+}
+.maint-icon{
+  width:64px;height:64px;margin:0 auto 18px;
+  display:flex;align-items:center;justify-content:center;
+  border-radius:50%;
+}
+.maint-icon.maintenance{background:linear-gradient(135deg,rgba(251,191,36,.22),rgba(251,113,133,.12));color:var(--amber)}
+.maint-icon.off{background:linear-gradient(135deg,rgba(244,63,94,.22),rgba(251,113,133,.12));color:var(--rose)}
+.maint-card h1{font-family:var(--font-display);font-size:22px;margin-bottom:10px}
+.maint-card p{color:var(--text-dim);font-size:14px;line-height:1.7;white-space:pre-wrap}
+`;
+
+function renderMaintenancePage(status, message) {
+    const isOff = status === 'off';
+    const title = isOff ? 'Website tạm ngưng' : 'Đang bảo trì';
+    return `<!DOCTYPE html>
+<html lang="vi"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NetSuper · ${title}</title>
+${THEME_HEAD}
+<style>${THEME_CSS}${MAINTENANCE_CSS}</style>
+</head><body>
+${THEME_BG}
+<header class="topbar">
+<a class="brand" href="/">
+<span class="brand-mark">${THEME_LOGO}</span>
+<span class="brand-name">ThichLenDo</span>
+</a>
+<span id="statusDot" class="status-dot ${isOff ? 'maintenance' : 'maintenance'}"><i></i>${isOff ? 'OFF' : 'BẢO TRÌ'}</span>
+</header>
+<main class="maint-wrap">
+<div class="card maint-card">
+<div class="maint-icon ${isOff ? 'off' : 'maintenance'}">
+<svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94z"/></svg>
+</div>
+<h1>${title}</h1>
+<p>${message.replace(/</g,'&lt;')}</p>
+</div>
+<div class="hint foot-credit" style="margin-top:22px">✦ Crafted by <b>ThichLenDo</b> ✦</div>
+</main>
+</body></html>`;
+}
+
 function renderTaskPage(token) {
     return `<!DOCTYPE html>
 <html lang="vi"><head>
@@ -2536,7 +2830,10 @@ ${THEME_BG}
 <span class="brand-mark">${THEME_LOGO}</span>
 <span class="brand-name">ThichLenDo</span>
 </a>
+<span style="display:flex;gap:8px;align-items:center">
+<span id="statusDot" class="status-dot online"><i></i>ONLINE</span>
 <a class="pill" href="/">← Trang chủ</a>
+</span>
 </header>
 
 <main class="task-wrap">
@@ -2620,19 +2917,4 @@ async function continueTask(btn) {
     location.href = j.url;
   } catch (e) { btn.textContent = 'Network error'; btn.disabled = false; }
 }
-function showError(t) {
-  document.getElementById('sub').innerHTML = '<span style="color:#ef4444">' + t + '</span>';
-  document.getElementById('progress').innerHTML = '';
-  document.getElementById('actions').innerHTML = '';
-  document.getElementById('status').textContent = '';
-}
-refresh();
-polling = setInterval(refresh, 3000);
-</script>
-${THEME_JS}
-</body></html>`;
-}
-
-// ============================================
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('✅ NetSuper running on port ' + PORT));
+function showE
