@@ -42,6 +42,14 @@ const DURATION_CONFIG = {
     '24h': { hours: 24, devices: 1,  steps: ['link4m', 'trafficvn', 'trafficvn', 'trafficvn', 'trafficvn'] }
 };
 
+// ⭐ Gói key VIP (mua) — hiển thị ở tab NetSuperVip trong Get Key, chưa có cổng thanh toán -> luôn "đang bảo trì" cho user thường
+const VIP_PACKAGES = {
+    '1d':   { label: 'Key 1 ngày',    price: 10000,  hours: 24,      permanent: false },
+    '7d':   { label: 'Key 7 ngày',    price: 50000,  hours: 24 * 7,  permanent: false },
+    '30d':  { label: 'Key 30 ngày',   price: 199000, hours: 24 * 30, permanent: false },
+    'perm': { label: 'Key Vĩnh viễn', price: 500000, hours: 0,       permanent: true  }
+};
+
 const MIN_LINK4M_MS = 80 * 1000;
 const MIN_TRAFFICVN_MS = 90 * 1000;
 const VALID_REFERERS = ['link4m.co','www.link4m.co','link4m.com','www.link4m.com','trafficvn.com','www.trafficvn.com'];
@@ -107,12 +115,13 @@ async function redisPipeline(commands) {
     } catch (e) { console.error('Pipeline err:', e.message); return null; }
 }
 
-async function saveKeyToRedis(key, expireAt, maxDevices = 0) {
+async function saveKeyToRedis(key, expireAt, maxDevices = 0, isVip = false) {
     const ttl = Math.max(1, Math.ceil((expireAt - Date.now()) / 1000));
     const value = JSON.stringify({
         hwids: [],
         maxDevices: Number(maxDevices) || 0,
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        vip: !!isVip
     });
     return await redisPipeline([
         ['SET', `ns:key:${key}`, value, 'EX', String(ttl)],
@@ -120,12 +129,13 @@ async function saveKeyToRedis(key, expireAt, maxDevices = 0) {
     ]);
 }
 
-async function saveManyKeysToRedis(keysList, expireAt, maxDevices = 0) {
+async function saveManyKeysToRedis(keysList, expireAt, maxDevices = 0, isVip = false) {
     const ttl = Math.max(1, Math.ceil((expireAt - Date.now()) / 1000));
     const value = JSON.stringify({
         hwids: [],
         maxDevices: Number(maxDevices) || 0,
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        vip: !!isVip
     });
     const batchSize = 100;
     for (let i = 0; i < keysList.length; i += batchSize) {
@@ -310,14 +320,44 @@ function isAdmin(req) {
     return isAdminIP(req) || (serial && ADMIN_SERIALS.includes(String(serial).trim()));
 }
 function genToken() { return crypto.randomBytes(16).toString('hex'); }
+
+// ⭐ Bộ ký tự cho key: thường (alnum) và VIP (alnum + ký tự đặc biệt, KHÔNG có dấu "-")
+const KEY_CHARSET_ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+const KEY_CHARSET_SPECIAL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*_=+?';
+function makeRandomBlock(len, charset) {
+    let s = '';
+    for (let i = 0; i < len; i++) s += charset[Math.floor(Math.random() * charset.length)];
+    return s;
+}
+// Kiểu đuôi cho romdo key (dùng ở panel RANDOM GENERATE của admin):
+// 'alnum12'  -> 12 ký tự hoa/thường/số
+// 'special9' -> 9 ký tự hoa/thường/số + ký tự đặc biệt (không có "-")
+const KEY_TAIL_STYLES = {
+    alnum12:  () => makeRandomBlock(12, KEY_CHARSET_ALNUM),
+    special9: () => makeRandomBlock(9,  KEY_CHARSET_SPECIAL)
+};
+function genKeyTail(style) {
+    const build = KEY_TAIL_STYLES[style] || KEY_TAIL_STYLES.special9;
+    return build();
+}
+// Chỉ giữ A-Z a-z 0-9 cho phần chữ đầu tuỳ chỉnh — không cho phép dấu "-" để
+// đảm bảo key VIP luôn chỉ có đúng 1 dấu "-" duy nhất.
+function sanitizeKeyPrefix(p) {
+    if (!p) return null;
+    const clean = String(p).replace(/[^A-Za-z0-9]/g, '').slice(0, 24);
+    return clean || null;
+}
+// Key thường mặc định (public get-key, quick-create, bulk-create) — GIỮ NGUYÊN format cũ
 function genKey() {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    const makeBlock = (len) => {
-        let s = '';
-        for (let i = 0; i < len; i++) s += chars[Math.floor(Math.random() * chars.length)];
-        return s;
-    };
-    return `NetSuper-${makeBlock(11)}-${makeBlock(10)}`;
+    return `NetSuper-${makeRandomBlock(11, KEY_CHARSET_ALNUM)}-${makeRandomBlock(10, KEY_CHARSET_ALNUM)}`;
+}
+// Key VIP: PREFIX-đuôi (1 dấu "-" duy nhất), đuôi mặc định mix hoa/thường/số/ký tự đặc biệt
+function genVipKey(prefix, style) {
+    return `${sanitizeKeyPrefix(prefix) || 'NetSuperVip'}-${genKeyTail(style || 'special9')}`;
+}
+// Key thường nhưng chữ đầu tuỳ chỉnh (dùng ở panel RANDOM GENERATE) — vẫn 1 dấu "-", đuôi chọn style
+function genCustomKey(prefix, style) {
+    return `${sanitizeKeyPrefix(prefix) || 'NetSuper'}-${genKeyTail(style || 'alnum12')}`;
 }
 function isRefererValid(referer) {
     if (!referer) return false;
@@ -576,9 +616,10 @@ app.get('/api/step-callback', async (req, res) => {
                 return res.redirect(`${SERVER_URL}/task?token=${token}`);
             }
         }
-        const key = genKey();
+        const isVipApp = task.app === 'netsupervip';
+        const key = isVipApp ? genVipKey('NetSuperVip', 'special9') : genKey();
         const expireAt = Date.now() + task.hours * 3600 * 1000;
-        await saveKeyToRedis(key, expireAt, task.maxDevices || 0);
+        await saveKeyToRedis(key, expireAt, task.maxDevices || 0, isVipApp);
         task.key = key;
         task.keyExpire = vnTime(new Date(expireAt));
         task.done = true;
@@ -695,7 +736,8 @@ app.post('/api/create-key', async (req, res) => {
     if (!calc) return res.json({ ok: false, message: 'bad_time' });
 
     const maxDev = Math.max(0, Number(maxDevices) || 0);
-    await saveKeyToRedis(content, calc.expireAt, maxDev);
+    const isVip = !!req.body.vip;
+    await saveKeyToRedis(content, calc.expireAt, maxDev, isVip);
 
     const totalHours = totalHoursOf(time || {});
     const steps = stepsForHours(totalHours);
@@ -703,7 +745,7 @@ app.post('/api/create-key', async (req, res) => {
     return res.json({
         ok: true, key: content, expireAt: calc.expireAt,
         expire: calc.isPermanent ? 'VĨNH VIỄN' : vnTime(new Date(calc.expireAt)),
-        isPermanent: calc.isPermanent, maxDevices: maxDev, steps
+        isPermanent: calc.isPermanent, maxDevices: maxDev, vip: isVip, steps
     });
 });
 
@@ -769,17 +811,126 @@ app.post('/api/delete-key', async (req, res) => {
     return res.json({ ok: true });
 });
 
+// ⭐ Reset key: chỉ áp dụng cho key VIP (key thường không reset được). Reset = xoá hết hwids,
+// giữ nguyên TTL/hạn còn lại -> key trở thành key trắng, chưa ai đăng nhập.
+app.post('/api/reset-key', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
+    const key = req.body.key;
+    if (!key) return res.json({ ok: false, message: 'no_key' });
+    const entry = await getKeyFromRedis(key);
+    if (!entry) return res.json({ ok: false, message: 'key_not_found' });
+    if (!entry.vip) return res.json({ ok: false, message: 'not_vip' });
+    entry.hwids = [];
+    const saved = await saveKeyEntry(key, entry);
+    if (!saved) return res.json({ ok: false, message: 'save_failed' });
+    return res.json({ ok: true });
+});
+
+// ⭐ RANDOM GENERATE: romdo key thường hoặc VIP, chữ đầu tuỳ chỉnh, đuôi chọn 1 trong 2 style
+// style 'alnum12'  -> 12 ký tự hoa/thường/số
+// style 'special9' -> 9 ký tự hoa/thường/số + ký tự đặc biệt (không dấu "-")
+app.post('/api/random-create', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
+    const { count, mode, duration, maxDevices, prefix, style, vip } = req.body;
+
+    let n = parseInt(count, 10) || 1;
+    if (n < 1) n = 1;
+    if (n > MAX_BULK) n = MAX_BULK;
+
+    const isVip = !!vip;
+    const maxDev = Math.max(0, Number(maxDevices) || 0);
+    const cleanPrefix = sanitizeKeyPrefix(prefix) || (isVip ? 'NetSuperVip' : 'NetSuper');
+    const tailStyle = style === 'alnum12' ? 'alnum12' : 'special9';
+
+    let calc, label;
+    if (mode === 'preset') {
+        const config = DURATION_CONFIG[duration];
+        if (!config) return res.json({ ok: false, message: 'bad_duration' });
+        calc = { expireAt: Date.now() + config.hours * 3600 * 1000, isPermanent: false };
+        label = duration.toUpperCase();
+    } else {
+        calc = calcExpire(req.body.time || {});
+        if (!calc) return res.json({ ok: false, message: 'bad_time' });
+        const totalHours = totalHoursOf(req.body.time || {});
+        label = calc.isPermanent ? 'VĨNH VIỄN' : totalHours.toFixed(1) + 'h';
+    }
+
+    const keysList = [];
+    const seen = new Set();
+    while (keysList.length < n) {
+        const k = `${cleanPrefix}-${genKeyTail(tailStyle)}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        keysList.push(k);
+    }
+    await saveManyKeysToRedis(keysList, calc.expireAt, maxDev, isVip);
+
+    return res.json({
+        ok: true, count: n, label, expireAt: calc.expireAt,
+        expire: calc.isPermanent ? 'VĨNH VIỄN' : vnTime(new Date(calc.expireAt)),
+        isPermanent: calc.isPermanent, maxDevices: maxDev, vip: isVip,
+        prefix: cleanPrefix, style: tailStyle, keys: keysList
+    });
+});
+
+// ⭐ VIP packages — public: mua key VIP (1 ngày/7 ngày/30 ngày/vĩnh viễn). Cổng thanh toán
+// chưa triển khai -> luôn trả "đang bảo trì" cho user thường (admin dùng /api/vip-admin-create bên dưới).
+app.get('/api/vip-packages', (req, res) => {
+    const packages = Object.entries(VIP_PACKAGES).map(([id, p]) => ({ id, label: p.label, price: p.price, permanent: p.permanent }));
+    return res.json({ ok: true, packages });
+});
+app.post('/api/vip-buy', (req, res) => {
+    const pkg = VIP_PACKAGES[req.body.package];
+    if (!pkg) return res.json({ ok: false, message: 'bad_package' });
+    return res.status(423).json({ ok: false, message: 'package_maintenance', label: pkg.label });
+});
+
+// ⭐ Admin tạo key VIP miễn phí theo gói (không cần mua) — chữ đầu tuỳ chỉnh, đuôi chọn style
+app.post('/api/vip-admin-create', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
+    const { package: pkgId, count, prefix, style, maxDevices } = req.body;
+    const pkg = VIP_PACKAGES[pkgId];
+    if (!pkg) return res.json({ ok: false, message: 'bad_package' });
+
+    let n = parseInt(count, 10) || 1;
+    if (n < 1) n = 1;
+    if (n > MAX_BULK) n = MAX_BULK;
+
+    const maxDev = Math.max(0, Number(maxDevices) || 0);
+    const cleanPrefix = sanitizeKeyPrefix(prefix) || 'NetSuperVip';
+    const tailStyle = style === 'alnum12' ? 'alnum12' : 'special9';
+    const expireAt = pkg.permanent ? PERMANENT_EXPIRE_AT() : Date.now() + pkg.hours * 3600 * 1000;
+
+    const keysList = [];
+    const seen = new Set();
+    while (keysList.length < n) {
+        const k = `${cleanPrefix}-${genKeyTail(tailStyle)}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        keysList.push(k);
+    }
+    await saveManyKeysToRedis(keysList, expireAt, maxDev, true);
+
+    return res.json({
+        ok: true, count: n, package: pkgId, label: pkg.label,
+        expireAt, expire: pkg.permanent ? 'VĨNH VIỄN' : vnTime(new Date(expireAt)),
+        isPermanent: pkg.permanent, maxDevices: maxDev, vip: true,
+        prefix: cleanPrefix, style: tailStyle, keys: keysList
+    });
+});
+
 app.post('/api/list-keys', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
     const list = await listKeysFromRedis();
     const out = [];
     for (const v of list) {
-        let maxDev = 0, usedDev = 0;
+        let maxDev = 0, usedDev = 0, vip = false;
         try {
             const entry = await getKeyFromRedis(v.key);
             if (entry) {
                 maxDev = Number(entry.maxDevices) || 0;
                 usedDev = Array.isArray(entry.hwids) ? entry.hwids.length : (entry.hwid ? 1 : 0);
+                vip = !!entry.vip;
             }
         } catch (e) {}
         out.push({
@@ -788,7 +939,8 @@ app.post('/api/list-keys', async (req, res) => {
             expire: (v.expireAt - Date.now() > PERMANENT_TTL_SEC * 1000 - 86400000)
                 ? 'VĨNH VIỄN' : vnTime(new Date(v.expireAt)),
             maxDevices: maxDev,
-            devices: usedDev
+            devices: usedDev,
+            vip
         });
     }
     return res.json({ ok: true, keys: out });
@@ -2462,9 +2614,11 @@ async function refreshStatusDot() {
 refreshStatusDot();
 setInterval(refreshStatusDot, 15000);
 
+let clientIsAdmin = false;
 (async () => {
   const r = await fetch('/api/verify-admin', {method:'POST'});
   const j = await r.json();
+  clientIsAdmin = !!j.isAdmin;
   if (j.isAdmin) {
     document.getElementById('adminPanel').style.display = 'block';
     await syncKeys();
@@ -2474,6 +2628,7 @@ setInterval(refreshStatusDot, 15000);
     setInterval(updateCountdowns, 1000);
     setInterval(syncKeys, 30000);
   }
+  renderAppDurations(); // re-render tab NetSuperVip đúng theo quyền admin/user thường
 })();
 
 async function loadSiteConfigForAdmin() {
@@ -2668,8 +2823,24 @@ function renderKeysTable(list) {
     const tr = document.createElement('tr');
     tr.setAttribute('data-key', k.key);
     const dev = (Number(k.maxDevices)||0) === 0 ? (k.devices||0) + '/∞' : (k.devices||0) + '/' + k.maxDevices;
-    tr.innerHTML = '<td class="k">'+k.key+'</td><td class="r">'+formatCountdown(remain)+'</td><td class="dev">'+dev+'</td><td style="font-size:11px;color:#8791a6">'+k.expire+'</td>';
+    const vipTag = k.vip ? ' <span style="font-size:9px;padding:1px 5px;border-radius:6px;background:rgba(168,85,247,.25);color:#c4b5fd">VIP</span>' : '';
+    tr.innerHTML = '<td class="k">'+k.key+vipTag+'</td><td class="r">'+formatCountdown(remain)+'</td><td class="dev">'+dev+'</td><td style="font-size:11px;color:#8791a6">'+k.expire+'</td>';
     const td = document.createElement('td');
+    td.style.cssText = 'display:flex;gap:6px';
+    if (k.vip) {
+      const rb = document.createElement('button');
+      rb.className = 'btn-purple'; rb.textContent = 'RESET';
+      rb.style.cssText = 'padding:5px 9px;font-size:11px;margin-top:0';
+      rb.onclick = async () => {
+        rb.disabled = true;
+        const r = await fetch('/api/reset-key', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k.key})});
+        const j = await r.json();
+        rb.disabled = false;
+        if (j.ok) { k.devices = 0; renderKeysTable(keysData); showMsg('✅ Đã reset key VIP', true); }
+        else showMsg('FAIL reset: ' + (j.message||''), false);
+      };
+      td.appendChild(rb);
+    }
     const b = document.createElement('button');
     b.className = 'del'; b.textContent = 'X';
     b.onclick = async () => {
@@ -2705,9 +2876,72 @@ function switchApp(appId) {
   document.getElementById('tabApp-netsupervip').classList.toggle('active', appId === 'netsupervip');
   renderAppDurations();
 }
+const VIP_PACKAGES_CLIENT = {
+  '1d':   { label: 'Key 1 ngày',    price: 10000 },
+  '7d':   { label: 'Key 7 ngày',    price: 50000 },
+  '30d':  { label: 'Key 30 ngày',   price: 199000 },
+  'perm': { label: 'Key Vĩnh viễn', price: 500000 }
+};
+function fmtVnd(n) { return n.toLocaleString('vi-VN') + 'đ'; }
+function renderVipPackages() {
+  const box = document.getElementById('appDurationBox');
+  box.innerHTML = '';
+  const grid = document.createElement('div');
+  grid.style.display = 'grid';
+  grid.style.gap = '8px';
+  Object.entries(VIP_PACKAGES_CLIENT).forEach(([id, p]) => {
+    const btn = document.createElement('button');
+    btn.innerHTML = '<b>' + p.label + '</b><span>' + fmtVnd(p.price) + '</span>';
+    btn.onclick = () => vipBuyClick(id, p.label);
+    grid.appendChild(btn);
+  });
+  box.appendChild(grid);
+  if (clientIsAdmin) {
+    const admBox = document.createElement('div');
+    admBox.style.cssText = 'margin-top:14px;padding:12px;border-radius:10px;border:1px solid var(--line);background:var(--field)';
+    admBox.innerHTML =
+      '<p class="card-sub" style="margin-bottom:8px">⭐ ADMIN — tạo key VIP miễn phí theo gói (không cần mua)</p>' +
+      '<label>Chữ đầu (prefix)</label><input id="vipAdminPrefix" value="NetSuperVip" style="margin-bottom:8px">' +
+      '<label>Kiểu đuôi</label>' +
+      '<div class="tab-bar" style="margin-bottom:8px">' +
+        '<button id="vipStyleSpecial" class="active" onclick="setVipAdminStyle(\\'special9\\')">Kiểu 2: hoa+thường+số+ký tự đặc biệt</button>' +
+        '<button id="vipStyleAlnum" onclick="setVipAdminStyle(\\'alnum12\\')">Kiểu 1: hoa+thường+số</button>' +
+      '</div>' +
+      '<label>Số lượng</label><input id="vipAdminCount" type="number" value="1" min="1" style="margin-bottom:8px">';
+    box.appendChild(admBox);
+  }
+}
+let vipAdminStyle = 'special9';
+function setVipAdminStyle(s) {
+  vipAdminStyle = s;
+  document.getElementById('vipStyleSpecial').classList.toggle('active', s === 'special9');
+  document.getElementById('vipStyleAlnum').classList.toggle('active', s === 'alnum12');
+}
+async function vipBuyClick(pkgId, label) {
+  const status = document.getElementById('getKeyStatus');
+  status.style.display = 'block'; status.style.color = '#888'; status.textContent = t('starting');
+  if (clientIsAdmin) {
+    const prefix = document.getElementById('vipAdminPrefix').value.trim() || 'NetSuperVip';
+    const count = parseInt(document.getElementById('vipAdminCount').value, 10) || 1;
+    const r = await fetch('/api/vip-admin-create', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({package: pkgId, count, prefix, style: vipAdminStyle})});
+    const j = await r.json();
+    if (!j.ok) { status.style.color='#ef4444'; status.textContent = t('error') + ': ' + (j.message||''); return; }
+    status.style.color = '#10b981';
+    status.textContent = j.count > 1 ? ('✅ ' + j.count + ' key VIP [' + j.label + ']: ' + j.keys.slice(0,3).join(', ') + (j.count>3?' ...':'') ) : ('✅ Key VIP: ' + j.keys[0]);
+    try { await navigator.clipboard.writeText(j.keys.join('\\n')); } catch (e) {}
+    j.keys.forEach(k => keysData.push({ key: k, expireAt: j.expireAt, expire: j.expire, maxDevices: j.maxDevices, devices: 0, vip: true }));
+    renderKeysTable(keysData);
+    return;
+  }
+  const r = await fetch('/api/vip-buy', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({package: pkgId})});
+  const j = await r.json();
+  status.style.color = '#f59e0b';
+  status.textContent = '🛠️ ' + (label || '') + ' — ' + t('durationMaintenance');
+}
 function renderAppDurations() {
   const box = document.getElementById('appDurationBox');
   if (!box) return;
+  if (currentGetKeyApp === 'netsupervip') { renderVipPackages(); return; }
   if (!appsConfigData || !appsConfigData[currentGetKeyApp]) { box.innerHTML = '<p class="card-sub">' + t('loading') + '</p>'; return; }
   const durations = appsConfigData[currentGetKeyApp].durations;
   const order = ['3h','6h','8h','12h','24h'];
