@@ -2917,4 +2917,31 @@ async function continueTask(btn) {
     location.href = j.url;
   } catch (e) { btn.textContent = 'Network error'; btn.disabled = false; }
 }
-function showE
+function showError(t) {
+  document.getElementById('sub').innerHTML = '<span style="color:#ef4444">' + t + '</span>';
+  document.getElementById('progress').innerHTML = '';
+  document.getElementById('actions').innerHTML = '';
+  document.getElementById('status').textContent = '';
+}
+async function refreshStatusDot() {
+  try {
+    const r = await fetch('/api/site-status');
+    const j = await r.json();
+    const dot = document.getElementById('statusDot');
+    if (!dot) return;
+    if (j.status === 'online') { dot.className = 'status-dot online'; dot.innerHTML = '<i></i>ONLINE'; }
+    else { dot.className = 'status-dot maintenance'; dot.innerHTML = '<i></i>' + (j.status === 'off' ? 'OFF' : 'BẢO TRÌ'); }
+  } catch (e) {}
+}
+refreshStatusDot();
+setInterval(refreshStatusDot, 15000);
+refresh();
+polling = setInterval(refresh, 3000);
+</script>
+${THEME_JS}
+</body></html>`;
+}
+
+// ============================================
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('✅ NetSuper running on port ' + PORT));
