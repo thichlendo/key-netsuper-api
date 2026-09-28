@@ -7,7 +7,7 @@ app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
 // ============================================
-// CONFIG — IP Admin ẩn
+// CONFIG
 // ============================================
 const ADMIN_IP_B64 = 'MTcxLjIzNy4yMDQuMTAx';
 const ADMIN_SERIAL_B64 = 'UjlKTjYwS0VQS0o=';
@@ -33,12 +33,13 @@ const LINK4M_API_URL = 'https://link4m.co/api-shorten/v2';
 const TRAFFICVN_API_KEY = 'b19399e1906b7bad23ed21c078a1edf7';
 const TRAFFICVN_API_URL = 'https://trafficvn.com/apidevelop';
 
+// ⭐ User get key = LUÔN 1 DEVICE cho mọi mức
 const DURATION_CONFIG = {
-    '3h':  { hours: 3,  steps: ['link4m'] },
-    '6h':  { hours: 6,  steps: ['link4m', 'trafficvn'] },
-    '8h':  { hours: 8,  steps: ['link4m', 'trafficvn', 'trafficvn'] },
-    '12h': { hours: 12, steps: ['link4m', 'trafficvn', 'trafficvn', 'trafficvn'] },
-    '24h': { hours: 24, steps: ['link4m', 'trafficvn', 'trafficvn', 'trafficvn', 'trafficvn'] }
+    '3h':  { hours: 3,  devices: 1,  steps: ['link4m'] },
+    '6h':  { hours: 6,  devices: 1,  steps: ['link4m', 'trafficvn'] },
+    '8h':  { hours: 8,  devices: 1,  steps: ['link4m', 'trafficvn', 'trafficvn'] },
+    '12h': { hours: 12, devices: 1,  steps: ['link4m', 'trafficvn', 'trafficvn', 'trafficvn'] },
+    '24h': { hours: 24, devices: 1,  steps: ['link4m', 'trafficvn', 'trafficvn', 'trafficvn', 'trafficvn'] }
 };
 
 const MIN_LINK4M_MS = 80 * 1000;
@@ -48,7 +49,6 @@ const BAD_UA_PATTERNS = ['curl','wget','python','okhttp','postman','insomnia','a
 const RATE_LIMIT_WINDOW = 60 * 60 * 1000;
 const RATE_LIMIT_MAX = 5;
 const MAX_BULK = 10000;
-
 const PERMANENT_TTL_SEC = 10 * 365 * 24 * 3600;
 const PERMANENT_EXPIRE_AT = () => Date.now() + PERMANENT_TTL_SEC * 1000;
 
@@ -84,7 +84,6 @@ async function redisPipeline(commands) {
     } catch (e) { console.error('Pipeline err:', e.message); return null; }
 }
 
-// 💾 Save key với maxDevices
 async function saveKeyToRedis(key, expireAt, maxDevices = 0) {
     const ttl = Math.max(1, Math.ceil((expireAt - Date.now()) / 1000));
     const value = JSON.stringify({
@@ -106,8 +105,7 @@ async function saveManyKeysToRedis(keysList, expireAt, maxDevices = 0) {
         createdAt: Date.now()
     });
     const batchSize = 100;
-    const total = keysList.length;
-    for (let i = 0; i < total; i += batchSize) {
+    for (let i = 0; i < keysList.length; i += batchSize) {
         const batch = keysList.slice(i, i + batchSize);
         const cmds = [];
         for (const k of batch) {
@@ -116,7 +114,7 @@ async function saveManyKeysToRedis(keysList, expireAt, maxDevices = 0) {
         }
         await redisPipeline(cmds);
     }
-    return total;
+    return keysList.length;
 }
 
 async function getKeyFromRedis(key) {
@@ -185,7 +183,6 @@ function isAdmin(req) {
     return isAdminIP(req) || (serial && ADMIN_SERIALS.includes(String(serial).trim()));
 }
 function genToken() { return crypto.randomBytes(16).toString('hex'); }
-
 function genKey() {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
     const makeBlock = (len) => {
@@ -195,7 +192,6 @@ function genKey() {
     };
     return `NetSuper-${makeBlock(11)}-${makeBlock(10)}`;
 }
-
 function isRefererValid(referer) {
     if (!referer) return false;
     try { return VALID_REFERERS.includes(new URL(referer).hostname.toLowerCase()); }
@@ -225,7 +221,6 @@ function isIPBlacklisted(ip) {
     if (entry.until > 0 && entry.until <= Date.now()) ipBlacklist.delete(ip);
     return false;
 }
-
 function detectBypass(req, task, stepType) {
     const reasons = [];
     const currentIP = getClientIP(req);
@@ -251,7 +246,6 @@ function detectBypass(req, task, stepType) {
         details: { elapsed: Math.round(elapsed/1000)+'s', ip: currentIP, ua: currentUA.substring(0,100) }
     };
 }
-
 function stepsForHours(h) {
     if (h >= 24) return ['link4m','trafficvn','trafficvn','trafficvn','trafficvn'];
     if (h >= 12) return ['link4m','trafficvn','trafficvn','trafficvn'];
@@ -259,7 +253,6 @@ function stepsForHours(h) {
     if (h >= 6)  return ['link4m','trafficvn'];
     return ['link4m'];
 }
-
 async function genShortLink(type, cb) {
     try {
         if (type === 'link4m') {
@@ -276,68 +269,46 @@ async function genShortLink(type, cb) {
     } catch (e) { console.error('genShortLink err:', e.message); }
     return null;
 }
-
 function calcExpire(t) {
-    if (t.permanent) {
-        return { expireAt: PERMANENT_EXPIRE_AT(), isPermanent: true };
-    }
+    if (t.permanent) return { expireAt: PERMANENT_EXPIRE_AT(), isPermanent: true };
     const years   = Number(t.years)   || 0;
     const months  = Number(t.months)  || 0;
     const days    = Number(t.days)    || 0;
     const hours   = Number(t.hours)   || 0;
     const minutes = Number(t.minutes) || 0;
     const seconds = Number(t.seconds) || 0;
-
-    const ms = years   * 365 * 24 * 3600 * 1000 +
-               months  * 30  * 24 * 3600 * 1000 +
-               days    * 24  * 3600 * 1000 +
-               hours   * 3600 * 1000 +
-               minutes * 60 * 1000 +
-               seconds * 1000;
-
+    const ms = years*365*24*3600*1000 + months*30*24*3600*1000 + days*24*3600*1000 +
+               hours*3600*1000 + minutes*60*1000 + seconds*1000;
     if (ms <= 0) return null;
     return { expireAt: Date.now() + ms, isPermanent: false };
 }
-
 function totalHoursOf(t) {
     if (t.permanent) return 87600;
-    const years   = Number(t.years)   || 0;
-    const months  = Number(t.months)  || 0;
-    const days    = Number(t.days)    || 0;
-    const hours   = Number(t.hours)   || 0;
-    const minutes = Number(t.minutes) || 0;
-    const seconds = Number(t.seconds) || 0;
-    return years*365*24 + months*30*24 + days*24 + hours + minutes/60 + seconds/3600;
+    return (Number(t.years)||0)*365*24 + (Number(t.months)||0)*30*24 + (Number(t.days)||0)*24 +
+           (Number(t.hours)||0) + (Number(t.minutes)||0)/60 + (Number(t.seconds)||0)/3600;
 }
 
 // ============================================
-// API: check-key — CÓ CHECK HWID LIMIT
+// API: check-key
 // ============================================
 app.get('/api/check-key', async (req, res) => {
     const key = req.query.key;
     const hwid = String(req.query.hwid || '').trim();
-
     if (!key) return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
 
     const entry = await getKeyFromRedis(key);
     if (!entry) return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
 
-    // Init hwids
-    if (!Array.isArray(entry.hwids)) {
-        entry.hwids = entry.hwid ? [entry.hwid] : [];
-    }
+    if (!Array.isArray(entry.hwids)) entry.hwids = entry.hwid ? [entry.hwid] : [];
     const maxDevices = Number(entry.maxDevices) || 0;
 
-    // Check HWID
     if (hwid) {
         if (entry.hwids.includes(hwid)) {
-            // Known device — OK
+            // known device — OK
         } else if (maxDevices === 0 || entry.hwids.length < maxDevices) {
-            // Add new device
             entry.hwids.push(hwid);
             await saveKeyEntry(key, entry);
         } else {
-            // Over device limit
             return res.json({
                 p: JSON.stringify({ ok: 0, reason: 'device_limit', max: maxDevices, used: entry.hwids.length }),
                 s: 'x'
@@ -349,7 +320,6 @@ app.get('/api/check-key', async (req, res) => {
     const exp = (ttl && ttl > 0)
         ? Math.floor((Date.now() + ttl * 1000) / 1000)
         : Math.floor(Date.now() / 1000) + 3600;
-
     return res.json({ p: JSON.stringify({ ok: 1, exp, maxDevices, devices: entry.hwids.length }), s: 'x' });
 });
 
@@ -367,20 +337,22 @@ app.post('/api/start-task', (req, res) => {
 
     const token = genToken();
     tasks.set(token, {
-        duration, steps: config.steps.slice(), hours: config.hours,
+        duration,
+        steps: config.steps.slice(),
+        hours: config.hours,
+        maxDevices: config.devices,        // ⭐ LUÔN = 1
         currentStep: 0, completedSteps: 0, totalSteps: config.steps.length,
         done: false, key: null, keyExpire: null,
         createdAt: Date.now(),
         clientIP, clientUA: req.headers['user-agent'] || '',
         isAdmin: isAdminIP(req),
         stepStartedAt: 0, stepIP: '', stepUA: '',
-        bypassed: false, bypassReason: null, callbackHistory: [],
-        maxDevices: 0
+        bypassed: false, bypassReason: null, callbackHistory: []
     });
     logIPTask(clientIP);
     setTimeout(() => tasks.delete(token), 30 * 60 * 1000);
 
-    return res.json({ ok: true, token, duration, totalSteps: config.steps.length, taskUrl: `${SERVER_URL}/task?token=${token}` });
+    return res.json({ ok: true, token, duration, totalSteps: config.steps.length, maxDevices: config.devices, taskUrl: `${SERVER_URL}/task?token=${token}` });
 });
 
 // ============================================
@@ -393,6 +365,7 @@ app.get('/api/task-status', (req, res) => {
         ok: true, duration: task.duration, progress: task.completedSteps, total: task.totalSteps,
         currentStep: task.currentStep, steps: task.steps, done: task.done,
         key: task.done ? task.key : null, keyExpire: task.keyExpire, hours: task.hours,
+        maxDevices: task.maxDevices || 0,
         bypassed: task.bypassed, bypassReason: task.bypassReason, isAdmin: task.isAdmin
     });
 });
@@ -462,9 +435,7 @@ app.get('/api/step-callback', async (req, res) => {
 // ============================================
 // ADMIN APIs
 // ============================================
-app.post('/api/verify-admin', (req, res) => {
-    return res.json({ isAdmin: isAdmin(req) });
-});
+app.post('/api/verify-admin', (req, res) => res.json({ isAdmin: isAdmin(req) }));
 
 app.post('/api/create-key', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
@@ -475,20 +446,15 @@ app.post('/api/create-key', async (req, res) => {
     if (!calc) return res.json({ ok: false, message: 'bad_time' });
 
     const maxDev = Math.max(0, Number(maxDevices) || 0);
-
     await saveKeyToRedis(content, calc.expireAt, maxDev);
 
     const totalHours = totalHoursOf(time || {});
     const steps = stepsForHours(totalHours);
 
     return res.json({
-        ok: true,
-        key: content,
-        expireAt: calc.expireAt,
+        ok: true, key: content, expireAt: calc.expireAt,
         expire: calc.isPermanent ? 'VĨNH VIỄN' : vnTime(new Date(calc.expireAt)),
-        isPermanent: calc.isPermanent,
-        maxDevices: maxDev,
-        steps
+        isPermanent: calc.isPermanent, maxDevices: maxDev, steps
     });
 });
 
@@ -504,14 +470,9 @@ app.post('/api/quick-create', async (req, res) => {
     await saveKeyToRedis(key, expireAt, maxDev);
 
     return res.json({
-        ok: true,
-        key,
-        duration,
-        hours: config.hours,
-        expireAt,
-        expire: vnTime(new Date(expireAt)),
-        maxDevices: maxDev,
-        steps: config.steps
+        ok: true, key, duration, hours: config.hours,
+        expireAt, expire: vnTime(new Date(expireAt)),
+        maxDevices: maxDev, steps: config.steps
     });
 });
 
@@ -524,10 +485,7 @@ app.post('/api/bulk-create', async (req, res) => {
     if (n > MAX_BULK) n = MAX_BULK;
 
     const maxDev = Math.max(0, Number(maxDevices) || 0);
-
-    let calc;
-    let steps;
-    let label;
+    let calc, steps, label;
 
     if (mode === 'preset') {
         const config = DURATION_CONFIG[duration];
@@ -549,15 +507,10 @@ app.post('/api/bulk-create', async (req, res) => {
     await saveManyKeysToRedis(keysList, calc.expireAt, maxDev);
 
     return res.json({
-        ok: true,
-        count: n,
-        label,
-        expireAt: calc.expireAt,
+        ok: true, count: n, label, expireAt: calc.expireAt,
         expire: calc.isPermanent ? 'VĨNH VIỄN' : vnTime(new Date(calc.expireAt)),
-        isPermanent: calc.isPermanent,
-        maxDevices: maxDev,
-        keys: keysList,
-        steps
+        isPermanent: calc.isPermanent, maxDevices: maxDev,
+        keys: keysList, steps
     });
 });
 
@@ -567,15 +520,12 @@ app.post('/api/delete-key', async (req, res) => {
     return res.json({ ok: true });
 });
 
-// ⭐ List keys + kèm info devices
 app.post('/api/list-keys', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
     const list = await listKeysFromRedis();
-
     const out = [];
     for (const v of list) {
-        let maxDev = 0;
-        let usedDev = 0;
+        let maxDev = 0, usedDev = 0;
         try {
             const entry = await getKeyFromRedis(v.key);
             if (entry) {
@@ -583,13 +533,11 @@ app.post('/api/list-keys', async (req, res) => {
                 usedDev = Array.isArray(entry.hwids) ? entry.hwids.length : (entry.hwid ? 1 : 0);
             }
         } catch (e) {}
-
         out.push({
             key: v.key,
             expireAt: v.expireAt,
             expire: (v.expireAt - Date.now() > PERMANENT_TTL_SEC * 1000 - 86400000)
-                ? 'VĨNH VIỄN'
-                : vnTime(new Date(v.expireAt)),
+                ? 'VĨNH VIỄN' : vnTime(new Date(v.expireAt)),
             maxDevices: maxDev,
             devices: usedDev
         });
@@ -638,7 +586,6 @@ button:active{transform:translateY(0);opacity:.85}
 button:disabled{background:#232838;color:var(--text-faint);cursor:not-allowed;transform:none}
 .btn-purple{background:linear-gradient(135deg,#a89bff,var(--violet));color:#fff}
 .btn-green{background:linear-gradient(135deg,#5eead4,var(--emerald));color:#04231b}
-.btn-red{background:linear-gradient(135deg,#ff8e9c,var(--red));color:#fff}
 label{display:block;font-size:11px;color:var(--text-faint);margin:12px 0 6px}
 input,select{width:100%;padding:12px 14px;background:var(--bg-2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;font-family:'Inter',sans-serif}
 input:focus,select:focus{outline:none;border-color:var(--gold);box-shadow:0 0 0 3px rgba(227,182,90,.15)}
@@ -649,6 +596,7 @@ th,td{padding:9px 6px;text-align:left;border-bottom:1px solid var(--border)}
 th{color:var(--text-faint);font-size:10px;text-transform:uppercase}
 td.k{color:var(--gold-soft);font-family:'JetBrains Mono',monospace;font-size:11px;word-break:break-all}
 td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
+td.dev{color:#c7bfff;font-family:'JetBrains Mono',monospace;font-size:11px}
 .del{background:rgba(255,93,108,.12);color:var(--red);border:1px solid rgba(255,93,108,.3);padding:5px 10px;border-radius:8px;cursor:pointer;width:auto;font-size:11px}
 #msg{text-align:center;padding:10px;border-radius:10px;margin-top:10px;font-size:12px;display:none}
 .ok{background:rgba(47,217,168,.12);color:var(--emerald);border:1px solid rgba(47,217,168,.25)}
@@ -689,8 +637,6 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
 .device-radio button{flex:1;padding:10px;font-size:12px;background:rgba(0,0,0,.3);color:var(--text-faint);border:1px solid var(--border);margin:0;font-weight:600}
 .device-radio button.active{background:rgba(138,124,255,.2);color:#c7bfff;border-color:#8a7cff}
 .device-radio button:hover{transform:none}
-.dev-count{color:#c7bfff;font-weight:600}
-td.dev{color:#c7bfff;font-family:'JetBrains Mono',monospace;font-size:11px}
 </style>
 </head><body>
 <div class="wrap">
@@ -701,11 +647,11 @@ td.dev{color:#c7bfff;font-family:'JetBrains Mono',monospace;font-size:11px}
 <h2>Get Key</h2>
 <button class="btn-purple" onclick="toggleMenu()" id="getKeyBtn">GET KEY</button>
 <div id="durationMenu">
-<button onclick="startTask('3h')"><b>3H</b><span>1 link</span></button>
-<button onclick="startTask('6h')"><b>6H</b><span>2 link</span></button>
-<button onclick="startTask('8h')"><b>8H</b><span>3 link</span></button>
-<button onclick="startTask('12h')"><b>12H</b><span>4 link</span></button>
-<button onclick="startTask('24h')" style="grid-column:span 2"><b>24H</b><span>5 link</span></button>
+<button onclick="startTask('3h')"><b>3H</b><span>1 device</span></button>
+<button onclick="startTask('6h')"><b>6H</b><span>1 device</span></button>
+<button onclick="startTask('8h')"><b>8H</b><span>1 device</span></button>
+<button onclick="startTask('12h')"><b>12H</b><span>1 device</span></button>
+<button onclick="startTask('24h')" style="grid-column:span 2"><b>24H</b><span>1 device</span></button>
 </div>
 <div id="getKeyStatus" style="display:none;text-align:center;margin-top:12px;color:#888;font-size:12px"></div>
 </div>
@@ -836,7 +782,7 @@ td.dev{color:#c7bfff;font-family:'JetBrains Mono',monospace;font-size:11px}
 <table id="tbl"><thead><tr><th>KEY</th><th>REMAIN</th><th>DEVICES</th><th>EXPIRE</th><th></th></tr></thead><tbody></tbody></table>
 </div>
 
-<div class="hint">✦ Crafted by ThichLenDo · v3.2 ✦</div>
+<div class="hint">✦ Crafted by ThichLenDo · v3.4 ✦</div>
 </div>
 
 <script>
@@ -855,9 +801,7 @@ const MAX_SHOW_KEYS = 20;
     const r = await fetch('/api/health');
     const j = await r.json();
     const badge = document.getElementById('redisBadge');
-    badge.innerHTML = j.redis
-      ? '<span class="status-badge status-online">● REDIS</span>'
-      : '<span class="status-badge status-offline">● OFFLINE</span>';
+    badge.innerHTML = j.redis ? '<span class="status-badge status-online">● REDIS</span>' : '<span class="status-badge status-offline">● OFFLINE</span>';
   } catch (e) {}
 })();
 
@@ -878,10 +822,7 @@ function formatCountdown(ms) {
   if (s > 365*24*3600*9) return '∞';
   const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
   const pad = n => String(n).padStart(2,'0');
-  if (h >= 24) {
-    const d = Math.floor(h/24), hh = h%24;
-    return d+'d '+pad(hh)+'h';
-  }
+  if (h >= 24) { const d = Math.floor(h/24), hh = h%24; return d+'d '+pad(hh)+'h'; }
   if (h > 0) return pad(h)+'h'+pad(m)+'m'+pad(sec)+'s';
   if (m > 0) return pad(m)+'m'+pad(sec)+'s';
   return pad(sec)+'s';
@@ -920,9 +861,7 @@ function renderKeysTable(list) {
     if (remain <= 0) return;
     const tr = document.createElement('tr');
     tr.setAttribute('data-key', k.key);
-    const dev = (Number(k.maxDevices)||0) === 0
-      ? (k.devices||0) + '/∞'
-      : (k.devices||0) + '/' + k.maxDevices;
+    const dev = (Number(k.maxDevices)||0) === 0 ? (k.devices||0) + '/∞' : (k.devices||0) + '/' + k.maxDevices;
     tr.innerHTML = '<td class="k">'+k.key+'</td><td class="r">'+formatCountdown(remain)+'</td><td class="dev">'+dev+'</td><td style="font-size:11px;color:#8791a6">'+k.expire+'</td>';
     const td = document.createElement('td');
     const b = document.createElement('button');
@@ -969,14 +908,8 @@ function pickPreset(d) {
   presetDuration = d;
   document.getElementById('presetPickedLabel').textContent = 'Đã chọn: ' + d.toUpperCase();
 }
-function togglePermanent() {
-  const chk = document.getElementById('permanentChk');
-  chk.checked = !chk.checked;
-}
-function toggleBulkPermanent() {
-  const chk = document.getElementById('bulkPermanentChk');
-  chk.checked = !chk.checked;
-}
+function togglePermanent() { document.getElementById('permanentChk').checked = !document.getElementById('permanentChk').checked; }
+function toggleBulkPermanent() { document.getElementById('bulkPermanentChk').checked = !document.getElementById('bulkPermanentChk').checked; }
 function setDeviceMode(m) {
   deviceMode = m;
   document.getElementById('devUnlimited').classList.toggle('active', m === 'unlimited');
@@ -995,7 +928,6 @@ function setBulkPresetDeviceMode(m) {
   document.getElementById('bpDevCustom').classList.toggle('active', m === 'custom');
   document.getElementById('bpDevCustomInput').style.display = m === 'custom' ? 'block' : 'none';
 }
-
 function getTimeObj(prefix) {
   return {
     years:   document.getElementById(prefix+'Year').value || 0,
@@ -1012,7 +944,6 @@ function getMaxDevices(mode, inputId) {
   const v = parseInt(document.getElementById(inputId).value, 10) || 1;
   return Math.max(1, v);
 }
-
 function showMsg(t, ok) {
   const m = document.getElementById('msg');
   m.textContent = t; m.className = ok ? 'ok' : 'err';
@@ -1024,19 +955,13 @@ function showResult(data) {
   document.getElementById('resultBox').style.display = 'block';
   const keyBox = document.getElementById('resultKey');
   const listBox = document.getElementById('resultKeysList');
-
-  const devInfo = (Number(data.maxDevices)||0) === 0
-    ? '📱 Vô hạn'
-    : '📱 ' + data.maxDevices + ' thiết bị';
+  const devInfo = (Number(data.maxDevices)||0) === 0 ? '📱 Vô hạn' : '📱 ' + data.maxDevices + ' thiết bị';
   const devTag = ' — ' + devInfo;
-
   if (data.keys && data.keys.length > 1) {
     keyBox.textContent = '✅ ' + data.keys.length + ' KEYS ' + (data.label ? '[' + data.label + ']' : '') + devTag;
     const show = data.keys.slice(0, MAX_SHOW_KEYS);
     let txt = show.join('\\n');
-    if (data.keys.length > MAX_SHOW_KEYS) {
-      txt += '\\n\\n... và ' + (data.keys.length - MAX_SHOW_KEYS) + ' keys nữa (bấm COPY ALL)';
-    }
+    if (data.keys.length > MAX_SHOW_KEYS) txt += '\\n\\n... và ' + (data.keys.length - MAX_SHOW_KEYS) + ' keys nữa (bấm COPY ALL)';
     listBox.textContent = txt;
     listBox.style.display = 'block';
   } else {
@@ -1047,30 +972,20 @@ function showResult(data) {
 async function createKey() {
   const content = document.getElementById('content').value.trim();
   if (!content) return showMsg('NO CONTENT', false);
-
   let timeObj;
-  if (currentTab === 'manual') {
-    timeObj = getTimeObj('t');
-  } else {
+  if (currentTab === 'manual') timeObj = getTimeObj('t');
+  else {
     if (!presetDuration) return showMsg('Chọn preset duration', false);
     const cfg = {'3h':3,'6h':6,'8h':8,'12h':12,'24h':24}[presetDuration];
     timeObj = { hours: cfg, permanent: false, years:0,months:0,days:0,minutes:0,seconds:0 };
   }
-
   if (!timeObj.permanent) {
-    const total = Number(timeObj.years||0)+Number(timeObj.months||0)+Number(timeObj.days||0)+
-                  Number(timeObj.hours||0)+Number(timeObj.minutes||0)+Number(timeObj.seconds||0);
+    const total = Number(timeObj.years||0)+Number(timeObj.months||0)+Number(timeObj.days||0)+Number(timeObj.hours||0)+Number(timeObj.minutes||0)+Number(timeObj.seconds||0);
     if (total <= 0) return showMsg('Chọn thời gian', false);
   }
-
   const maxDevices = getMaxDevices(deviceMode, 'maxDevices');
-
   showMsg('Creating...', true);
-  const r = await fetch('/api/create-key', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({content, time: timeObj, maxDevices})
-  });
+  const r = await fetch('/api/create-key', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content, time: timeObj, maxDevices})});
   const j = await r.json();
   if (j.ok) {
     showMsg('✅ OK', true);
@@ -1079,27 +994,17 @@ async function createKey() {
     renderKeysTable(keysData);
   } else showMsg('FAIL: ' + (j.message||''), false);
 }
-
 async function bulkCreateCustom() {
   const count = parseInt(document.getElementById('bulkCount').value, 10) || 1;
-  if (count < 1) return showMsg('Số lượng >= 1', false);
-  if (count > 10000) return showMsg('Tối đa 10,000', false);
-
+  if (count < 1 || count > 10000) return showMsg('1-10000', false);
   const timeObj = getTimeObj('b');
   if (!timeObj.permanent) {
-    const total = Number(timeObj.years||0)+Number(timeObj.months||0)+Number(timeObj.days||0)+
-                  Number(timeObj.hours||0)+Number(timeObj.minutes||0)+Number(timeObj.seconds||0);
+    const total = Number(timeObj.years||0)+Number(timeObj.months||0)+Number(timeObj.days||0)+Number(timeObj.hours||0)+Number(timeObj.minutes||0)+Number(timeObj.seconds||0);
     if (total <= 0) return showMsg('Chọn thời gian', false);
   }
-
   const maxDevices = getMaxDevices(bulkDeviceMode, 'bulkMaxDevices');
-
   showMsg('Đang tạo ' + count + ' key...', true);
-  const r = await fetch('/api/bulk-create', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({count, time: timeObj, mode: 'custom', maxDevices})
-  });
+  const r = await fetch('/api/bulk-create', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count, time: timeObj, mode: 'custom', maxDevices})});
   const j = await r.json();
   if (j.ok) {
     showMsg('✅ Đã tạo ' + j.count + ' key', true);
@@ -1109,20 +1014,12 @@ async function bulkCreateCustom() {
     try { await navigator.clipboard.writeText(j.keys.join('\\n')); } catch (e) {}
   } else showMsg('FAIL: ' + (j.message||''), false);
 }
-
 async function bulkCreatePreset(duration) {
   const count = parseInt(document.getElementById('bulkCount').value, 10) || 1;
-  if (count < 1) return showMsg('Số lượng >= 1', false);
-  if (count > 10000) return showMsg('Tối đa 10,000', false);
-
+  if (count < 1 || count > 10000) return showMsg('1-10000', false);
   const maxDevices = getMaxDevices(bulkPresetDeviceMode, 'bulkPresetMaxDevices');
-
   showMsg('Đang tạo ' + count + ' key ' + duration.toUpperCase() + '...', true);
-  const r = await fetch('/api/bulk-create', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({count, mode: 'preset', duration, maxDevices})
-  });
+  const r = await fetch('/api/bulk-create', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({count, mode: 'preset', duration, maxDevices})});
   const j = await r.json();
   if (j.ok) {
     showMsg('✅ ' + j.count + ' key ' + duration.toUpperCase(), true);
@@ -1132,22 +1029,15 @@ async function bulkCreatePreset(duration) {
     try { await navigator.clipboard.writeText(j.keys.join('\\n')); } catch (e) {}
   } else showMsg('FAIL: ' + (j.message||''), false);
 }
-
 function copyAllResult() {
   if (!lastResult) return;
-  const devInfo = (Number(lastResult.maxDevices)||0) === 0
-    ? '📱 Vô hạn'
-    : '📱 ' + lastResult.maxDevices + ' thiết bị';
+  const devInfo = (Number(lastResult.maxDevices)||0) === 0 ? '📱 Vô hạn' : '📱 ' + lastResult.maxDevices + ' thiết bị';
   let txt = '';
   if (lastResult.keys && lastResult.keys.length > 1) {
     txt = '🔑 ' + lastResult.keys.length + ' KEYS ' + (lastResult.label ? '[' + lastResult.label + ']' : '') + '\\n';
-    txt += '⏱️ Expire: ' + lastResult.expire + '\\n';
-    txt += devInfo + '\\n\\n';
-    txt += lastResult.keys.join('\\n');
+    txt += '⏱️ Expire: ' + lastResult.expire + '\\n' + devInfo + '\\n\\n' + lastResult.keys.join('\\n');
   } else {
-    txt = '🔑 KEY: ' + (lastResult.key || lastResult.keys[0]) + '\\n';
-    txt += '⏱️ Expire: ' + lastResult.expire + '\\n';
-    txt += devInfo + '\\n';
+    txt = '🔑 KEY: ' + (lastResult.key || lastResult.keys[0]) + '\\n⏱️ Expire: ' + lastResult.expire + '\\n' + devInfo + '\\n';
   }
   navigator.clipboard.writeText(txt).then(() => showMsg('✅ Copied!', true));
 }
@@ -1218,7 +1108,8 @@ async function refresh() {
     if (polling) clearInterval(polling);
     return;
   }
-  document.getElementById('sub').innerHTML = 'Duration: <span class="duration-badge">' + j.duration.toUpperCase() + '</span>' + (j.isAdmin ? ' [ADMIN]' : '');
+  const devTag = j.maxDevices > 0 ? ' · ' + j.maxDevices + ' device' : '';
+  document.getElementById('sub').innerHTML = 'Duration: <span class="duration-badge">' + j.duration.toUpperCase() + '</span>' + devTag + (j.isAdmin ? ' [ADMIN]' : '');
   const prog = document.getElementById('progress');
   prog.innerHTML = '';
   j.steps.forEach((type, i) => {
