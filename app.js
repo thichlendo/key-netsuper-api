@@ -50,7 +50,7 @@ const RATE_LIMIT_WINDOW = 60 * 60 * 1000;
 const RATE_LIMIT_MAX = 5;
 
 // ============================================
-// UPSTASH REDIS
+// UPSTASH REDIS — dùng HSET/HGETALL/HDEL (Upstash free cho phép)
 // ============================================
 async function redis(...args) {
     if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
@@ -94,6 +94,7 @@ async function redisPipeline(commands) {
     }
 }
 
+// 💾 Save key — SET key + HSET meta
 async function saveKeyToRedis(key, expireAt, hwid = '') {
     const ttl = Math.max(1, Math.ceil((expireAt - Date.now()) / 1000));
     const value = JSON.stringify({ hwid, createdAt: Date.now() });
@@ -186,6 +187,7 @@ function genToken() {
     return crypto.randomBytes(16).toString('hex');
 }
 
+// 🎲 Format key: NETSUPER-XXXX-XXXX-XXXX
 function genKey() {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
     const block = () => {
@@ -570,6 +572,8 @@ app.post('/api/verify-admin', (req, res) => {
 // ============================================
 // API ADMIN
 // ============================================
+
+// Tạo key tự do (nhập content + giờ/phút/giây)
 app.post('/api/create-key', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
     const { content, hours, minutes, seconds } = req.body;
@@ -585,6 +589,30 @@ app.post('/api/create-key', async (req, res) => {
         ok: true,
         key: content,
         expireAt: expireAt,
+        expire: vnTime(new Date(expireAt))
+    });
+});
+
+// ⭐ Tạo key NHANH theo giờ (3h/6h/8h/12h/24h) — chỉ admin
+app.post('/api/quick-create', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
+
+    const { duration } = req.body;
+    const config = DURATION_CONFIG[duration];
+    if (!config) return res.json({ ok: false, message: 'bad_duration' });
+
+    const key = genKey();
+    const durationMs = config.hours * 3600 * 1000;
+    const expireAt = Date.now() + durationMs;
+
+    await saveKeyToRedis(key, expireAt);
+
+    return res.json({
+        ok: true,
+        key,
+        duration,
+        hours: config.hours,
+        expireAt,
         expire: vnTime(new Date(expireAt))
     });
 });
@@ -739,6 +767,15 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace;font-variant-nu
 .status-badge{display:inline-flex;align-items:center;gap:5px;font-size:10px;padding:3px 8px;border-radius:10px;margin-left:8px}
 .status-online{background:rgba(47,217,168,.15);color:var(--emerald);border:1px solid rgba(47,217,168,.3)}
 .status-offline{background:rgba(255,93,108,.15);color:var(--red);border:1px solid rgba(255,93,108,.3)}
+.section-title{font-family:'Sora',sans-serif;font-size:11px;color:var(--text-faint);letter-spacing:.6px;text-transform:uppercase;margin:18px 0 8px;display:flex;align-items:center;gap:8px}
+.section-title::before{content:'';flex:1;height:1px;background:var(--border)}
+.section-title::after{content:'';flex:1;height:1px;background:var(--border)}
+.quick-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.quick-grid button{padding:14px 10px;font-size:14px;background:var(--bg-2);color:var(--text);border:1px solid var(--border);box-shadow:none}
+.quick-grid button:hover{border-color:var(--emerald);background:rgba(47,217,168,.06)}
+.quick-grid button b{font-family:'Sora',sans-serif;color:var(--emerald);display:block;font-size:16px}
+.quick-grid button span{font-size:10px;color:var(--text-faint);display:block;margin-top:2px}
+.quick-grid button.wide{grid-column:span 2}
 </style>
 </head><body>
 <div class="wrap">
@@ -760,6 +797,7 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace;font-variant-nu
 
 <div class="card" id="adminPanel">
 <h2>Admin Panel</h2>
+
 <label>Key Content</label>
 <input id="content" placeholder="VIP-ABC">
 <label>Duration</label>
@@ -769,6 +807,16 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace;font-variant-nu
 <input id="s" type="number" placeholder="s" value="0">
 </div>
 <button class="btn-green" onclick="createKey()">CREATE KEY</button>
+
+<div class="section-title">QUICK CREATE (ADMIN ONLY)</div>
+<div class="quick-grid">
+<button onclick="quickCreate('3h')"><b>3H</b><span>1 click tạo</span></button>
+<button onclick="quickCreate('6h')"><b>6H</b><span>1 click tạo</span></button>
+<button onclick="quickCreate('8h')"><b>8H</b><span>1 click tạo</span></button>
+<button onclick="quickCreate('12h')"><b>12H</b><span>1 click tạo</span></button>
+<button class="wide" onclick="quickCreate('24h')"><b>24H</b><span>1 click tạo key 24 giờ</span></button>
+</div>
+
 <div id="msg"></div>
 <table id="tbl"><thead><tr><th>KEY</th><th>REMAIN</th><th>EXPIRE</th><th></th></tr></thead><tbody></tbody></table>
 </div>
@@ -778,7 +826,7 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace;font-variant-nu
 <div id="bypassLogList"></div>
 </div>
 
-<div class="hint">✦ Crafted by ThichLenDo · v2.1 (Redis Hash) ✦</div>
+<div class="hint">✦ Crafted by ThichLenDo · v2.2 (Redis Hash + Quick Create) ✦</div>
 </div>
 
 <script>
@@ -965,7 +1013,7 @@ function showMsg(t, ok) {
   m.textContent = t;
   m.className = ok ? 'ok' : 'err';
   m.style.display = 'block';
-  setTimeout(() => m.style.display = 'none', 2500);
+  setTimeout(() => m.style.display = 'none', 3000);
 }
 
 async function createKey() {
@@ -991,6 +1039,32 @@ async function createKey() {
     renderKeysTable(keysData);
   } else {
     showMsg('FAIL', false);
+  }
+}
+
+// ⭐ Quick create — admin tạo key nhanh theo giờ
+async function quickCreate(duration) {
+  const r = await fetch('/api/quick-create', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({duration})
+  });
+  const j = await r.json();
+  if (j.ok) {
+    showMsg('OK [' + j.duration.toUpperCase() + '] ' + j.key, true);
+    keysData.push({
+      key: j.key,
+      expireAt: j.expireAt,
+      expire: j.expire
+    });
+    renderKeysTable(keysData);
+
+    // Auto copy key vào clipboard
+    try {
+      await navigator.clipboard.writeText(j.key);
+    } catch (e) {}
+  } else {
+    showMsg('FAIL: ' + (j.message || 'unknown'), false);
   }
 }
 
