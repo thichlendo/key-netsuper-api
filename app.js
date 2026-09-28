@@ -3,14 +3,14 @@ const crypto = require('crypto');
 const app = express();
 
 app.set('trust proxy', true);
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
 // ============================================
-// CONFIG — IP Admin ẩn bằng base64
+// CONFIG — IP Admin ẩn
 // ============================================
-const ADMIN_IP_B64 = 'MTcxLjIzNy4yMDQuMTAx';         // 171.237.204.101
-const ADMIN_SERIAL_B64 = 'UjlKTjYwS0VQS0o=';          // R9JN60KEPKJ
+const ADMIN_IP_B64 = 'MTcxLjIzNy4yMDQuMTAx';
+const ADMIN_SERIAL_B64 = 'UjlKTjYwS0VQS0o=';
 const SERVER_URL = process.env.SERVER_URL || 'https://key-netsuper-api.onrender.com';
 
 function getAdminIP() {
@@ -48,6 +48,10 @@ const BAD_UA_PATTERNS = ['curl','wget','python','okhttp','postman','insomnia','a
 const RATE_LIMIT_WINDOW = 60 * 60 * 1000;
 const RATE_LIMIT_MAX = 5;
 const MAX_BULK = 10000;
+
+// Key vĩnh viễn dùng TTL rất lớn (10 năm)
+const PERMANENT_TTL_SEC = 10 * 365 * 24 * 3600; // 10 năm
+const PERMANENT_EXPIRE_AT = () => Date.now() + PERMANENT_TTL_SEC * 1000;
 
 // ============================================
 // REDIS
@@ -165,7 +169,6 @@ function isAdmin(req) {
 }
 function genToken() { return crypto.randomBytes(16).toString('hex'); }
 
-// 🎲 Format key: NetSuper-{11 chars}-{10 chars}  (A-Z a-z 0-9)
 function genKey() {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
     const makeBlock = (len) => {
@@ -257,6 +260,41 @@ async function genShortLink(type, cb) {
     return null;
 }
 
+// ⏱️ Tính expire từ object thời gian
+// { years, months, days, hours, minutes, seconds, permanent }
+function calcExpire(t) {
+    if (t.permanent) {
+        return { expireAt: PERMANENT_EXPIRE_AT(), isPermanent: true };
+    }
+    const years   = Number(t.years)   || 0;
+    const months  = Number(t.months)  || 0;
+    const days    = Number(t.days)    || 0;
+    const hours   = Number(t.hours)   || 0;
+    const minutes = Number(t.minutes) || 0;
+    const seconds = Number(t.seconds) || 0;
+
+    const ms = years   * 365 * 24 * 3600 * 1000 +
+               months  * 30  * 24 * 3600 * 1000 +
+               days    * 24  * 3600 * 1000 +
+               hours   * 3600 * 1000 +
+               minutes * 60 * 1000 +
+               seconds * 1000;
+
+    if (ms <= 0) return null;
+    return { expireAt: Date.now() + ms, isPermanent: false };
+}
+
+function totalHoursOf(t) {
+    if (t.permanent) return 87600; // coi như 10 năm cho step calculation
+    const years   = Number(t.years)   || 0;
+    const months  = Number(t.months)  || 0;
+    const days    = Number(t.days)    || 0;
+    const hours   = Number(t.hours)   || 0;
+    const minutes = Number(t.minutes) || 0;
+    const seconds = Number(t.seconds) || 0;
+    return years*365*24 + months*30*24 + days*24 + hours + minutes/60 + seconds/3600;
+}
+
 // ============================================
 // API: check-key
 // ============================================
@@ -279,7 +317,7 @@ app.get('/api/check-key', async (req, res) => {
 });
 
 // ============================================
-// API: start-task (user)
+// API: start-task
 // ============================================
 app.post('/api/start-task', (req, res) => {
     const clientIP = getClientIP(req);
@@ -390,31 +428,31 @@ app.post('/api/verify-admin', (req, res) => {
     return res.json({ isAdmin: isAdmin(req) });
 });
 
-// Tạo 1 key
+// Tạo 1 key với content tùy chỉnh
 app.post('/api/create-key', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
-    const { content, hours, minutes, seconds } = req.body;
-    if (!content) return res.json({ ok: false });
+    const { content, time } = req.body;
+    if (!content) return res.json({ ok: false, message: 'no_content' });
 
-    const ms = (Number(hours)||0)*3600000 + (Number(minutes)||0)*60000 + (Number(seconds)||0)*1000;
-    if (ms <= 0) return res.json({ ok: false });
+    const calc = calcExpire(time || {});
+    if (!calc) return res.json({ ok: false, message: 'bad_time' });
 
-    const expireAt = Date.now() + ms;
-    await saveKeyToRedis(content, expireAt);
+    await saveKeyToRedis(content, calc.expireAt);
 
-    const totalHours = ms / 3600000;
+    const totalHours = totalHoursOf(time || {});
     const steps = stepsForHours(totalHours);
 
     return res.json({
         ok: true,
         key: content,
-        expireAt,
-        expire: vnTime(new Date(expireAt)),
+        expireAt: calc.expireAt,
+        expire: calc.isPermanent ? 'VĨNH VIỄN' : vnTime(new Date(calc.expireAt)),
+        isPermanent: calc.isPermanent,
         steps
     });
 });
 
-// Tạo 1 key nhanh theo duration (random)
+// Tạo 1 key nhanh theo duration preset
 app.post('/api/quick-create', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
     const { duration } = req.body;
@@ -436,32 +474,49 @@ app.post('/api/quick-create', async (req, res) => {
     });
 });
 
-// ⭐ Tạo NHIỀU key cùng lúc
+// ⭐ Bulk create với time tùy chỉnh
 app.post('/api/bulk-create', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
-    const { duration, count } = req.body;
-    const config = DURATION_CONFIG[duration];
-    if (!config) return res.json({ ok: false, message: 'bad_duration' });
+    const { count, time, mode, duration } = req.body;
 
     let n = parseInt(count, 10) || 1;
     if (n < 1) n = 1;
     if (n > MAX_BULK) n = MAX_BULK;
 
-    const expireAt = Date.now() + config.hours * 3600 * 1000;
+    let calc;
+    let steps;
+    let label;
+
+    if (mode === 'preset') {
+        // Dùng preset duration
+        const config = DURATION_CONFIG[duration];
+        if (!config) return res.json({ ok: false, message: 'bad_duration' });
+        calc = { expireAt: Date.now() + config.hours * 3600 * 1000, isPermanent: false };
+        steps = config.steps;
+        label = duration.toUpperCase();
+    } else {
+        // Custom time
+        calc = calcExpire(time || {});
+        if (!calc) return res.json({ ok: false, message: 'bad_time' });
+        const totalHours = totalHoursOf(time || {});
+        steps = stepsForHours(totalHours);
+        label = calc.isPermanent ? 'VĨNH VIỄN' : totalHours.toFixed(1) + 'h';
+    }
+
     const keysList = [];
     for (let i = 0; i < n; i++) keysList.push(genKey());
 
-    await saveManyKeysToRedis(keysList, expireAt);
+    await saveManyKeysToRedis(keysList, calc.expireAt);
 
     return res.json({
         ok: true,
         count: n,
-        duration,
-        hours: config.hours,
-        expireAt,
-        expire: vnTime(new Date(expireAt)),
+        label,
+        expireAt: calc.expireAt,
+        expire: calc.isPermanent ? 'VĨNH VIỄN' : vnTime(new Date(calc.expireAt)),
+        isPermanent: calc.isPermanent,
         keys: keysList,
-        steps: config.steps
+        steps
     });
 });
 
@@ -474,7 +529,13 @@ app.post('/api/delete-key', async (req, res) => {
 app.post('/api/list-keys', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
     const list = await listKeysFromRedis();
-    const out = list.map(v => ({ key: v.key, expireAt: v.expireAt, expire: vnTime(new Date(v.expireAt)) }));
+    const out = list.map(v => ({
+        key: v.key,
+        expireAt: v.expireAt,
+        expire: (v.expireAt - Date.now() > PERMANENT_TTL_SEC * 1000 - 86400000)
+            ? 'VĨNH VIỄN'
+            : vnTime(new Date(v.expireAt))
+    }));
     return res.json({ ok: true, keys: out });
 });
 
@@ -519,9 +580,10 @@ button:active{transform:translateY(0);opacity:.85}
 button:disabled{background:#232838;color:var(--text-faint);cursor:not-allowed;transform:none}
 .btn-purple{background:linear-gradient(135deg,#a89bff,var(--violet));color:#fff}
 .btn-green{background:linear-gradient(135deg,#5eead4,var(--emerald));color:#04231b}
+.btn-red{background:linear-gradient(135deg,#ff8e9c,var(--red));color:#fff}
 label{display:block;font-size:11px;color:var(--text-faint);margin:12px 0 6px}
-input{width:100%;padding:12px 14px;background:var(--bg-2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;font-family:'Inter',sans-serif}
-input:focus{outline:none;border-color:var(--gold);box-shadow:0 0 0 3px rgba(227,182,90,.15)}
+input,select{width:100%;padding:12px 14px;background:var(--bg-2);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:13px;font-family:'Inter',sans-serif}
+input:focus,select:focus{outline:none;border-color:var(--gold);box-shadow:0 0 0 3px rgba(227,182,90,.15)}
 .row{display:flex;gap:8px;margin-top:8px}
 .row input{flex:1}
 table{width:100%;font-size:12px;border-collapse:collapse;margin-top:10px}
@@ -553,9 +615,16 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
 .status-badge{display:inline-flex;align-items:center;gap:5px;font-size:10px;padding:3px 8px;border-radius:10px;margin-left:8px}
 .status-online{background:rgba(47,217,168,.15);color:var(--emerald);border:1px solid rgba(47,217,168,.3)}
 .status-offline{background:rgba(255,93,108,.15);color:var(--red);border:1px solid rgba(255,93,108,.3)}
-.count-row{display:flex;align-items:center;gap:10px;margin-top:8px}
-.count-row label{margin:0;flex-shrink:0}
-.count-row input{margin:0}
+.tab-bar{display:flex;gap:6px;margin:8px 0 12px;background:rgba(0,0,0,.3);padding:4px;border-radius:12px}
+.tab-bar button{flex:1;padding:8px;font-size:11px;background:transparent;color:var(--text-faint);border:none;margin:0;box-shadow:none;font-weight:600}
+.tab-bar button.active{background:rgba(47,217,168,.15);color:var(--emerald)}
+.tab-bar button:hover{transform:none;background:rgba(255,255,255,.05)}
+.tab-bar button.active:hover{background:rgba(47,217,168,.15)}
+.time-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:6px}
+.time-grid input{padding:10px 8px;text-align:center;font-size:12px}
+.permanent-box{display:flex;align-items:center;gap:8px;margin-top:10px;padding:10px;background:rgba(255,93,108,.08);border:1px solid rgba(255,93,108,.3);border-radius:10px;cursor:pointer}
+.permanent-box input[type="checkbox"]{width:auto;margin:0;transform:scale(1.3);accent-color:#ff5d6c}
+.permanent-box span{font-size:12px;color:#ff8e9c;font-weight:600}
 </style>
 </head><body>
 <div class="wrap">
@@ -577,36 +646,84 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
 
 <div class="card" id="adminPanel">
 <h2>Admin Panel</h2>
+
 <label>Key Content</label>
 <input id="content" placeholder="VIP-ABC">
-<label>Duration</label>
-<div class="row">
-<input id="h" type="number" placeholder="h" value="0">
-<input id="m" type="number" placeholder="m" value="0">
-<input id="s" type="number" placeholder="s" value="0">
+
+<label>Time</label>
+<div class="tab-bar">
+<button id="tabManual" class="active" onclick="switchTab('manual')">TÙY CHỈNH</button>
+<button id="tabPreset" onclick="switchTab('preset')">PRESET</button>
 </div>
+
+<div id="manualTime">
+<div class="time-grid">
+<input id="tYear" type="number" placeholder="Năm" value="0" min="0">
+<input id="tMonth" type="number" placeholder="Tháng" value="0" min="0">
+<input id="tDay" type="number" placeholder="Ngày" value="0" min="0">
+</div>
+<div class="time-grid" style="margin-top:6px">
+<input id="tHour" type="number" placeholder="Giờ" value="0" min="0">
+<input id="tMin" type="number" placeholder="Phút" value="0" min="0">
+<input id="tSec" type="number" placeholder="Giây" value="0" min="0">
+</div>
+<div class="permanent-box" onclick="togglePermanent()">
+<input type="checkbox" id="permanentChk">
+<span>🔒 VĨNH VIỄN (không hết hạn)</span>
+</div>
+</div>
+
+<div id="presetTime" style="display:none">
+<div class="quick-grid">
+<button onclick="pickPreset('3h')"><b>3H</b></button>
+<button onclick="pickPreset('6h')"><b>6H</b></button>
+<button onclick="pickPreset('8h')"><b>8H</b></button>
+<button onclick="pickPreset('12h')"><b>12H</b></button>
+<button class="wide" onclick="pickPreset('24h')"><b>24H</b></button>
+</div>
+<input type="hidden" id="presetPicked" value="">
+<div id="presetPickedLabel" style="text-align:center;font-size:11px;color:var(--text-faint);margin-top:8px"></div>
+</div>
+
 <button class="btn-green" onclick="createKey()">CREATE KEY</button>
 
-<div class="section-title">QUICK CREATE (SINGLE)</div>
-<div class="quick-grid">
-<button onclick="quickCreate('3h')"><b>3H</b><span>1 key</span></button>
-<button onclick="quickCreate('6h')"><b>6H</b><span>1 key</span></button>
-<button onclick="quickCreate('8h')"><b>8H</b><span>1 key</span></button>
-<button onclick="quickCreate('12h')"><b>12H</b><span>1 key</span></button>
-<button class="wide" onclick="quickCreate('24h')"><b>24H</b><span>1 key</span></button>
+<div class="section-title">BULK CREATE</div>
+<label>Số lượng key</label>
+<input id="bulkCount" type="number" value="10" min="1" max="10000">
+
+<div style="margin-top:10px">
+<div class="tab-bar">
+<button id="tabBulkManual" class="active" onclick="switchBulkTab('manual')">TÙY CHỈNH</button>
+<button id="tabBulkPreset" onclick="switchBulkTab('preset')">PRESET</button>
+</div>
 </div>
 
-<div class="section-title">BULK CREATE (NHIỀU KEY)</div>
-<div class="count-row">
-<label style="font-size:11px;color:var(--text-faint)">Số lượng:</label>
-<input id="bulkCount" type="number" value="10" min="1" max="10000" style="padding:10px">
+<div id="bulkManualTime">
+<div class="time-grid">
+<input id="bYear" type="number" placeholder="Năm" value="0" min="0">
+<input id="bMonth" type="number" placeholder="Tháng" value="0" min="0">
+<input id="bDay" type="number" placeholder="Ngày" value="0" min="0">
 </div>
-<div class="quick-grid" style="margin-top:8px">
-<button onclick="bulkCreate('3h')"><b>3H</b><span>tạo hàng loạt</span></button>
-<button onclick="bulkCreate('6h')"><b>6H</b><span>tạo hàng loạt</span></button>
-<button onclick="bulkCreate('8h')"><b>8H</b><span>tạo hàng loạt</span></button>
-<button onclick="bulkCreate('12h')"><b>12H</b><span>tạo hàng loạt</span></button>
-<button class="wide" onclick="bulkCreate('24h')"><b>24H</b><span>tạo hàng loạt</span></button>
+<div class="time-grid" style="margin-top:6px">
+<input id="bHour" type="number" placeholder="Giờ" value="0" min="0">
+<input id="bMin" type="number" placeholder="Phút" value="0" min="0">
+<input id="bSec" type="number" placeholder="Giây" value="0" min="0">
+</div>
+<div class="permanent-box" onclick="toggleBulkPermanent()">
+<input type="checkbox" id="bulkPermanentChk">
+<span>🔒 VĨNH VIỄN (không hết hạn)</span>
+</div>
+<button class="btn-green" style="margin-top:10px" onclick="bulkCreateCustom()">⚡ TẠO HÀNG LOẠT</button>
+</div>
+
+<div id="bulkPresetTime" style="display:none">
+<div class="quick-grid">
+<button onclick="bulkCreatePreset('3h')"><b>3H</b><span>tạo hàng loạt</span></button>
+<button onclick="bulkCreatePreset('6h')"><b>6H</b><span>tạo hàng loạt</span></button>
+<button onclick="bulkCreatePreset('8h')"><b>8H</b><span>tạo hàng loạt</span></button>
+<button onclick="bulkCreatePreset('12h')"><b>12H</b><span>tạo hàng loạt</span></button>
+<button class="wide" onclick="bulkCreatePreset('24h')"><b>24H</b><span>tạo hàng loạt</span></button>
+</div>
 </div>
 
 <div id="msg"></div>
@@ -621,12 +738,15 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
 <table id="tbl"><thead><tr><th>KEY</th><th>REMAIN</th><th>EXPIRE</th><th></th></tr></thead><tbody></tbody></table>
 </div>
 
-<div class="hint">✦ Crafted by ThichLenDo · v3.0 ✦</div>
+<div class="hint">✦ Crafted by ThichLenDo · v3.1 ✦</div>
 </div>
 
 <script>
 let keysData = [];
 let lastResult = null;
+let currentTab = 'manual';
+let currentBulkTab = 'manual';
+let presetDuration = '';
 const MAX_SHOW_KEYS = 20;
 
 (async () => {
@@ -653,8 +773,14 @@ const MAX_SHOW_KEYS = 20;
 
 function formatCountdown(ms) {
   if (ms <= 0) return '00s';
-  const s = Math.floor(ms/1000), h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+  const s = Math.floor(ms/1000);
+  if (s > 365*24*3600*9) return '∞';
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
   const pad = n => String(n).padStart(2,'0');
+  if (h >= 24) {
+    const d = Math.floor(h/24), hh = h%24;
+    return d+'d '+pad(hh)+'h';
+  }
   if (h > 0) return pad(h)+'h'+pad(m)+'m'+pad(sec)+'s';
   if (m > 0) return pad(m)+'m'+pad(sec)+'s';
   return pad(sec)+'s';
@@ -720,6 +846,46 @@ async function startTask(duration) {
   status.textContent = 'Opening...'; status.style.color = '#10b981';
   location.href = j.taskUrl;
 }
+
+function switchTab(t) {
+  currentTab = t;
+  document.getElementById('tabManual').classList.toggle('active', t === 'manual');
+  document.getElementById('tabPreset').classList.toggle('active', t === 'preset');
+  document.getElementById('manualTime').style.display = t === 'manual' ? 'block' : 'none';
+  document.getElementById('presetTime').style.display = t === 'preset' ? 'block' : 'none';
+}
+function switchBulkTab(t) {
+  currentBulkTab = t;
+  document.getElementById('tabBulkManual').classList.toggle('active', t === 'manual');
+  document.getElementById('tabBulkPreset').classList.toggle('active', t === 'preset');
+  document.getElementById('bulkManualTime').style.display = t === 'manual' ? 'block' : 'none';
+  document.getElementById('bulkPresetTime').style.display = t === 'preset' ? 'block' : 'none';
+}
+function pickPreset(d) {
+  presetDuration = d;
+  document.getElementById('presetPickedLabel').textContent = 'Đã chọn: ' + d.toUpperCase();
+}
+function togglePermanent() {
+  const chk = document.getElementById('permanentChk');
+  chk.checked = !chk.checked;
+}
+function toggleBulkPermanent() {
+  const chk = document.getElementById('bulkPermanentChk');
+  chk.checked = !chk.checked;
+}
+
+function getTimeObj(prefix) {
+  return {
+    years:   document.getElementById(prefix+'Year').value || 0,
+    months:  document.getElementById(prefix+'Month').value || 0,
+    days:    document.getElementById(prefix+'Day').value || 0,
+    hours:   document.getElementById(prefix+'Hour').value || 0,
+    minutes: document.getElementById(prefix+'Min').value || 0,
+    seconds: document.getElementById(prefix+'Sec').value || 0,
+    permanent: document.getElementById(prefix === 't' ? 'permanentChk' : 'bulkPermanentChk').checked
+  };
+}
+
 function showMsg(t, ok) {
   const m = document.getElementById('msg');
   m.textContent = t; m.className = ok ? 'ok' : 'err';
@@ -733,7 +899,7 @@ function showResult(data) {
   const listBox = document.getElementById('resultKeysList');
 
   if (data.keys && data.keys.length > 1) {
-    keyBox.textContent = '✅ ' + data.keys.length + ' KEYS (' + data.duration.toUpperCase() + ')';
+    keyBox.textContent = '✅ ' + data.keys.length + ' KEYS ' + (data.label ? '[' + data.label + ']' : '');
     const show = data.keys.slice(0, MAX_SHOW_KEYS);
     let txt = show.join('\\n');
     if (data.keys.length > MAX_SHOW_KEYS) {
@@ -748,64 +914,92 @@ function showResult(data) {
 }
 async function createKey() {
   const content = document.getElementById('content').value.trim();
-  const hours = document.getElementById('h').value || 0;
-  const minutes = document.getElementById('m').value || 0;
-  const seconds = document.getElementById('s').value || 0;
   if (!content) return showMsg('NO CONTENT', false);
+
+  let timeObj;
+  if (currentTab === 'manual') {
+    timeObj = getTimeObj('t');
+  } else {
+    if (!presetDuration) return showMsg('Chọn preset duration', false);
+    const cfg = {'3h':3,'6h':6,'8h':8,'12h':12,'24h':24}[presetDuration];
+    timeObj = { hours: cfg, permanent: false, years:0,months:0,days:0,minutes:0,seconds:0 };
+  }
+
+  if (!timeObj.permanent) {
+    const total = Number(timeObj.years||0)+Number(timeObj.months||0)+Number(timeObj.days||0)+
+                  Number(timeObj.hours||0)+Number(timeObj.minutes||0)+Number(timeObj.seconds||0);
+    if (total <= 0) return showMsg('Chọn thời gian', false);
+  }
+
   showMsg('Creating...', true);
-  const r = await fetch('/api/create-key', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content, hours, minutes, seconds})});
+  const r = await fetch('/api/create-key', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({content, time: timeObj})
+  });
   const j = await r.json();
   if (j.ok) {
     showMsg('✅ OK', true);
-    showResult({ key: j.key, keys: [j.key], duration: 'custom', expire: j.expire });
+    showResult({ key: j.key, keys: [j.key], label: j.isPermanent ? 'VĨNH VIỄN' : '', expire: j.expire });
     keysData.push({ key: j.key, expireAt: j.expireAt, expire: j.expire });
     renderKeysTable(keysData);
-  } else showMsg('FAIL', false);
+  } else showMsg('FAIL: ' + (j.message||''), false);
 }
-async function quickCreate(duration) {
-  showMsg('Creating ' + duration.toUpperCase() + '...', true);
-  const r = await fetch('/api/quick-create', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({duration})});
+
+async function bulkCreateCustom() {
+  const count = parseInt(document.getElementById('bulkCount').value, 10) || 1;
+  if (count < 1) return showMsg('Số lượng >= 1', false);
+  if (count > 10000) return showMsg('Tối đa 10,000', false);
+
+  const timeObj = getTimeObj('b');
+  if (!timeObj.permanent) {
+    const total = Number(timeObj.years||0)+Number(timeObj.months||0)+Number(timeObj.days||0)+
+                  Number(timeObj.hours||0)+Number(timeObj.minutes||0)+Number(timeObj.seconds||0);
+    if (total <= 0) return showMsg('Chọn thời gian', false);
+  }
+
+  showMsg('Đang tạo ' + count + ' key...', true);
+  const r = await fetch('/api/bulk-create', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({count, time: timeObj, mode: 'custom'})
+  });
   const j = await r.json();
   if (j.ok) {
-    showMsg('✅ ' + j.key, true);
-    showResult({ key: j.key, keys: [j.key], duration, expire: j.expire });
-    keysData.push({ key: j.key, expireAt: j.expireAt, expire: j.expire });
+    showMsg('✅ Đã tạo ' + j.count + ' key', true);
+    showResult({ keys: j.keys, label: j.label, expire: j.expire, count: j.count });
+    j.keys.forEach(k => keysData.push({ key: k, expireAt: j.expireAt, expire: j.expire }));
     renderKeysTable(keysData);
-    try { await navigator.clipboard.writeText(j.key); } catch (e) {}
-  } else showMsg('FAIL: ' + (j.message || ''), false);
+    try { await navigator.clipboard.writeText(j.keys.join('\\n')); } catch (e) {}
+  } else showMsg('FAIL: ' + (j.message||''), false);
 }
-async function bulkCreate(duration) {
-  const countEl = document.getElementById('bulkCount');
-  const count = parseInt(countEl.value, 10) || 1;
-  if (count < 1) return showMsg('Số lượng phải >= 1', false);
-  if (count > 10000) return showMsg('Tối đa 10,000 key/lần', false);
+
+async function bulkCreatePreset(duration) {
+  const count = parseInt(document.getElementById('bulkCount').value, 10) || 1;
+  if (count < 1) return showMsg('Số lượng >= 1', false);
+  if (count > 10000) return showMsg('Tối đa 10,000', false);
 
   showMsg('Đang tạo ' + count + ' key ' + duration.toUpperCase() + '...', true);
   const r = await fetch('/api/bulk-create', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({duration, count})
+    body:JSON.stringify({count, mode: 'preset', duration})
   });
   const j = await r.json();
   if (j.ok) {
-    showMsg('✅ Đã tạo ' + j.count + ' key ' + duration.toUpperCase(), true);
-    showResult({
-      keys: j.keys,
-      duration: j.duration,
-      expire: j.expire,
-      count: j.count
-    });
-    // Thêm vào bảng keysData
+    showMsg('✅ ' + j.count + ' key ' + duration.toUpperCase(), true);
+    showResult({ keys: j.keys, label: j.label, expire: j.expire, count: j.count });
     j.keys.forEach(k => keysData.push({ key: k, expireAt: j.expireAt, expire: j.expire }));
     renderKeysTable(keysData);
     try { await navigator.clipboard.writeText(j.keys.join('\\n')); } catch (e) {}
-  } else showMsg('FAIL: ' + (j.message || ''), false);
+  } else showMsg('FAIL: ' + (j.message||''), false);
 }
+
 function copyAllResult() {
   if (!lastResult) return;
   let txt = '';
   if (lastResult.keys && lastResult.keys.length > 1) {
-    txt = '🔑 ' + lastResult.keys.length + ' KEYS [' + (lastResult.duration||'').toUpperCase() + ']\\n';
+    txt = '🔑 ' + lastResult.keys.length + ' KEYS ' + (lastResult.label ? '[' + lastResult.label + ']' : '') + '\\n';
     txt += '⏱️ Expire: ' + lastResult.expire + '\\n\\n';
     txt += lastResult.keys.join('\\n');
   } else {
