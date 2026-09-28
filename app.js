@@ -3,22 +3,30 @@ const crypto = require('crypto');
 const app = express();
 
 app.set('trust proxy', true);
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // ============================================
-// CONFIG
+// CONFIG — IP Admin ẩn bằng base64
 // ============================================
-const ADMIN_IPS = ['171.237.204.101'];
-const ADMIN_SERIALS = ['R9JN60KEPKJ'];
+const ADMIN_IP_B64 = 'MTcxLjIzNy4yMDQuMTAx';         // 171.237.204.101
+const ADMIN_SERIAL_B64 = 'UjlKTjYwS0VQS0o=';          // R9JN60KEPKJ
 const SERVER_URL = process.env.SERVER_URL || 'https://key-netsuper-api.onrender.com';
+
+function getAdminIP() {
+    try { return Buffer.from(ADMIN_IP_B64, 'base64').toString('utf8'); }
+    catch (e) { return '0.0.0.0'; }
+}
+function getAdminSerial() {
+    try { return Buffer.from(ADMIN_SERIAL_B64, 'base64').toString('utf8'); }
+    catch (e) { return ''; }
+}
+const ADMIN_IPS = [getAdminIP()];
+const ADMIN_SERIALS = [getAdminSerial()];
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-
-if (!UPSTASH_URL || !UPSTASH_TOKEN) {
-    console.error('❌ Thiếu UPSTASH env');
-}
+if (!UPSTASH_URL || !UPSTASH_TOKEN) console.error('❌ Thiếu UPSTASH env');
 
 const LINK4M_API_KEY = '6a61ce8626fd3a13155f6529';
 const LINK4M_API_URL = 'https://link4m.co/api-shorten/v2';
@@ -39,9 +47,10 @@ const VALID_REFERERS = ['link4m.co','www.link4m.co','link4m.com','www.link4m.com
 const BAD_UA_PATTERNS = ['curl','wget','python','okhttp','postman','insomnia','axios','node-fetch','go-http-client','java/','libwww','httpie','powershell','headlesschrome','phantomjs','selenium','puppeteer','playwright'];
 const RATE_LIMIT_WINDOW = 60 * 60 * 1000;
 const RATE_LIMIT_MAX = 5;
+const MAX_BULK = 10000;
 
 // ============================================
-// REDIS — Hash (Upstash free cho phép)
+// REDIS
 // ============================================
 async function redis(...args) {
     if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
@@ -52,7 +61,7 @@ async function redis(...args) {
             body: JSON.stringify(args)
         });
         const j = await r.json();
-        if (j.error) { console.error('Redis error:', j.error); return null; }
+        if (j.error) { console.error('Redis err:', j.error); return null; }
         return j.result;
     } catch (e) { console.error('Redis err:', e.message); return null; }
 }
@@ -66,28 +75,36 @@ async function redisPipeline(commands) {
             body: JSON.stringify(commands)
         });
         const j = await r.json();
-        if (Array.isArray(j)) {
-            j.forEach((item, idx) => {
-                if (item && item.error) console.error(`[Pipeline ${idx}]`, item.error);
-            });
-        } else if (j.error) {
-            console.error('[Pipeline]', j.error);
-        }
+        if (Array.isArray(j)) j.forEach((it, i) => { if (it && it.error) console.error(`[P${i}]`, it.error); });
+        else if (j.error) console.error('[Pipeline]', j.error);
         return j;
     } catch (e) { console.error('Pipeline err:', e.message); return null; }
 }
 
-async function saveKeyToRedis(key, expireAt, hwid = '') {
+async function saveKeyToRedis(key, expireAt) {
     const ttl = Math.max(1, Math.ceil((expireAt - Date.now()) / 1000));
-    console.log(`[SAVE] key=${key} ttl=${ttl}s expireAt=${new Date(expireAt).toISOString()}`);
-    const value = JSON.stringify({ hwid, createdAt: Date.now() });
-    const result = await redisPipeline([
+    const value = JSON.stringify({ hwid: '', createdAt: Date.now() });
+    return await redisPipeline([
         ['SET', `ns:key:${key}`, value, 'EX', String(ttl)],
         ['HSET', 'ns:meta', key, String(expireAt)]
     ]);
-    const check = await redis('GET', `ns:key:${key}`);
-    console.log(`[VERIFY] ${key} => ${check ? 'OK' : 'MISSING'}`);
-    return result;
+}
+
+async function saveManyKeysToRedis(keysList, expireAt) {
+    const ttl = Math.max(1, Math.ceil((expireAt - Date.now()) / 1000));
+    const value = JSON.stringify({ hwid: '', createdAt: Date.now() });
+    const batchSize = 100;
+    const total = keysList.length;
+    for (let i = 0; i < total; i += batchSize) {
+        const batch = keysList.slice(i, i + batchSize);
+        const cmds = [];
+        for (const k of batch) {
+            cmds.push(['SET', `ns:key:${k}`, value, 'EX', String(ttl)]);
+            cmds.push(['HSET', 'ns:meta', k, String(expireAt)]);
+        }
+        await redisPipeline(cmds);
+    }
+    return total;
 }
 
 async function getKeyFromRedis(key) {
@@ -147,11 +164,18 @@ function isAdmin(req) {
     return isAdminIP(req) || (serial && ADMIN_SERIALS.includes(String(serial).trim()));
 }
 function genToken() { return crypto.randomBytes(16).toString('hex'); }
+
+// 🎲 Format key: NetSuper-{11 chars}-{10 chars}  (A-Z a-z 0-9)
 function genKey() {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    const block = () => { let s=''; for(let i=0;i<4;i++) s+=chars[Math.floor(Math.random()*chars.length)]; return s; };
-    return `NETSUPER-${block()}-${block()}-${block()}`;
+    const makeBlock = (len) => {
+        let s = '';
+        for (let i = 0; i < len; i++) s += chars[Math.floor(Math.random() * chars.length)];
+        return s;
+    };
+    return `NetSuper-${makeBlock(11)}-${makeBlock(10)}`;
 }
+
 function isRefererValid(referer) {
     if (!referer) return false;
     try { return VALID_REFERERS.includes(new URL(referer).hostname.toLowerCase()); }
@@ -188,12 +212,9 @@ function detectBypass(req, task, stepType) {
     const currentUA = req.headers['user-agent'] || '';
     const currentReferer = req.headers['referer'] || req.headers['referrer'] || '';
     const elapsed = Date.now() - task.stepStartedAt;
-
     let minTime = stepType === 'link4m' ? MIN_LINK4M_MS : MIN_TRAFFICVN_MS;
-    if (elapsed < minTime) {
-        reasons.push(`Thời gian quá ngắn (${Math.round(elapsed/1000)}s < ${Math.round(minTime/1000)}s)`);
-    }
-    if (currentIP !== task.stepIP) reasons.push(`IP thay đổi`);
+    if (elapsed < minTime) reasons.push(`Thời gian quá ngắn (${Math.round(elapsed/1000)}s < ${Math.round(minTime/1000)}s)`);
+    if (currentIP !== task.stepIP) reasons.push('IP thay đổi');
     const uaLower = currentUA.toLowerCase();
     if (!currentUA) reasons.push('Thiếu User-Agent');
     else {
@@ -204,7 +225,6 @@ function detectBypass(req, task, stepType) {
     else if (!isRefererValid(currentReferer)) reasons.push('Referer không hợp lệ');
     const cbKey = `${task.duration}-${task.currentStep}`;
     if (task.callbackHistory && task.callbackHistory.includes(cbKey)) reasons.push('Replay detected');
-
     return {
         bypass: reasons.length > 0,
         reasons,
@@ -212,7 +232,6 @@ function detectBypass(req, task, stepType) {
     };
 }
 
-// Xác định steps dựa trên tổng giờ
 function stepsForHours(h) {
     if (h >= 24) return ['link4m','trafficvn','trafficvn','trafficvn','trafficvn'];
     if (h >= 12) return ['link4m','trafficvn','trafficvn','trafficvn'];
@@ -221,7 +240,6 @@ function stepsForHours(h) {
     return ['link4m'];
 }
 
-// Generate link rút gọn cho 1 step
 async function genShortLink(type, cb) {
     try {
         if (type === 'link4m') {
@@ -237,39 +255,6 @@ async function genShortLink(type, cb) {
         }
     } catch (e) { console.error('genShortLink err:', e.message); }
     return null;
-}
-
-// Tạo task + generate tất cả link
-async function createTaskWithLinks(steps, hours, presetKey, duration) {
-    const token = genToken();
-    const task = {
-        duration: duration || 'custom',
-        steps: steps.slice(),
-        hours,
-        currentStep: 0,
-        completedSteps: 0,
-        totalSteps: steps.length,
-        done: false,
-        key: presetKey || null,
-        keyExpire: null,
-        presetKey: presetKey || null,
-        createdAt: Date.now(),
-        isAdmin: true,
-        stepStartedAt: 0, stepIP: '', stepUA: '',
-        bypassed: false, bypassReason: null,
-        callbackHistory: []
-    };
-    tasks.set(token, task);
-    setTimeout(() => tasks.delete(token), 30 * 60 * 1000);
-
-    const links = [];
-    for (let i = 0; i < steps.length; i++) {
-        const cb = `${SERVER_URL}/api/step-callback?token=${token}&step=${i}&r=${Date.now()}-${i}`;
-        const url = await genShortLink(steps[i], cb);
-        links.push({ step: i, type: steps[i], url: url || cb });
-    }
-
-    return { token, links };
 }
 
 // ============================================
@@ -309,7 +294,7 @@ app.post('/api/start-task', (req, res) => {
     tasks.set(token, {
         duration, steps: config.steps.slice(), hours: config.hours,
         currentStep: 0, completedSteps: 0, totalSteps: config.steps.length,
-        done: false, key: null, keyExpire: null, presetKey: null,
+        done: false, key: null, keyExpire: null,
         createdAt: Date.now(),
         clientIP, clientUA: req.headers['user-agent'] || '',
         isAdmin: isAdminIP(req),
@@ -346,13 +331,11 @@ app.get('/api/continue-task', async (req, res) => {
     if (task.bypassed) return res.json({ ok: false, message: 'bypassed' });
     const step = task.currentStep;
     if (step >= task.steps.length) return res.json({ ok: false });
-
     const type = task.steps[step];
     const cb = `${SERVER_URL}/api/step-callback?token=${req.query.token}&step=${step}&r=${Date.now()}`;
     task.stepStartedAt = Date.now();
     task.stepIP = getClientIP(req);
     task.stepUA = req.headers['user-agent'] || '';
-
     const url = await genShortLink(type, cb);
     if (!url) return res.json({ ok: false, message: 'link_error' });
     return res.json({ ok: true, url, step, total: task.totalSteps, type });
@@ -389,18 +372,11 @@ app.get('/api/step-callback', async (req, res) => {
     task.stepStartedAt = 0; task.stepIP = ''; task.stepUA = '';
 
     if (task.completedSteps >= task.totalSteps) {
-        if (task.presetKey) {
-            // Key đã tạo sẵn từ admin
-            task.key = task.presetKey;
-            const ttl = await redis('TTL', `ns:key:${task.presetKey}`);
-            task.keyExpire = (ttl && ttl > 0) ? vnTime(new Date(Date.now() + ttl * 1000)) : 'N/A';
-        } else {
-            const key = genKey();
-            const expireAt = Date.now() + task.hours * 3600 * 1000;
-            await saveKeyToRedis(key, expireAt);
-            task.key = key;
-            task.keyExpire = vnTime(new Date(expireAt));
-        }
+        const key = genKey();
+        const expireAt = Date.now() + task.hours * 3600 * 1000;
+        await saveKeyToRedis(key, expireAt);
+        task.key = key;
+        task.keyExpire = vnTime(new Date(expireAt));
         task.done = true;
     }
 
@@ -411,9 +387,10 @@ app.get('/api/step-callback', async (req, res) => {
 // ADMIN APIs
 // ============================================
 app.post('/api/verify-admin', (req, res) => {
-    return res.json({ isAdmin: isAdmin(req), ip: getClientIP(req) });
+    return res.json({ isAdmin: isAdmin(req) });
 });
 
+// Tạo 1 key
 app.post('/api/create-key', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
     const { content, hours, minutes, seconds } = req.body;
@@ -425,20 +402,19 @@ app.post('/api/create-key', async (req, res) => {
     const expireAt = Date.now() + ms;
     await saveKeyToRedis(content, expireAt);
 
-    // Tạo task + link rút gọn
     const totalHours = ms / 3600000;
     const steps = stepsForHours(totalHours);
-    const { links } = await createTaskWithLinks(steps, totalHours, content, 'custom');
 
     return res.json({
         ok: true,
         key: content,
         expireAt,
         expire: vnTime(new Date(expireAt)),
-        links
+        steps
     });
 });
 
+// Tạo 1 key nhanh theo duration (random)
 app.post('/api/quick-create', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
     const { duration } = req.body;
@@ -446,11 +422,8 @@ app.post('/api/quick-create', async (req, res) => {
     if (!config) return res.json({ ok: false });
 
     const key = genKey();
-    const durationMs = config.hours * 3600 * 1000;
-    const expireAt = Date.now() + durationMs;
+    const expireAt = Date.now() + config.hours * 3600 * 1000;
     await saveKeyToRedis(key, expireAt);
-
-    const { links } = await createTaskWithLinks(config.steps, config.hours, key, duration);
 
     return res.json({
         ok: true,
@@ -459,7 +432,36 @@ app.post('/api/quick-create', async (req, res) => {
         hours: config.hours,
         expireAt,
         expire: vnTime(new Date(expireAt)),
-        links
+        steps: config.steps
+    });
+});
+
+// ⭐ Tạo NHIỀU key cùng lúc
+app.post('/api/bulk-create', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
+    const { duration, count } = req.body;
+    const config = DURATION_CONFIG[duration];
+    if (!config) return res.json({ ok: false, message: 'bad_duration' });
+
+    let n = parseInt(count, 10) || 1;
+    if (n < 1) n = 1;
+    if (n > MAX_BULK) n = MAX_BULK;
+
+    const expireAt = Date.now() + config.hours * 3600 * 1000;
+    const keysList = [];
+    for (let i = 0; i < n; i++) keysList.push(genKey());
+
+    await saveManyKeysToRedis(keysList, expireAt);
+
+    return res.json({
+        ok: true,
+        count: n,
+        duration,
+        hours: config.hours,
+        expireAt,
+        expire: vnTime(new Date(expireAt)),
+        keys: keysList,
+        steps: config.steps
     });
 });
 
@@ -472,7 +474,7 @@ app.post('/api/delete-key', async (req, res) => {
 app.post('/api/list-keys', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
     const list = await listKeysFromRedis();
-    const out = list.map(v => ({ key: v.key, expireAt: v.expireAt, expire: vnTime(new Date(v.expireAt)), hwid: 'free' }));
+    const out = list.map(v => ({ key: v.key, expireAt: v.expireAt, expire: vnTime(new Date(v.expireAt)) }));
     return res.json({ ok: true, keys: out });
 });
 
@@ -499,7 +501,7 @@ const MAIN_HTML = `<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NETSUPER</title>
+<title>NetSuper</title>
 <link href="https://fonts.googleapis.com/css2?family=Sora:wght@600;700;800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#0a0d14;--bg-2:#11141d;--border:rgba(255,255,255,.08);--gold:#e3b65a;--gold-soft:#f4d998;--emerald:#2fd9a8;--violet:#8a7cff;--red:#ff5d6c;--text:#eef0f5;--text-dim:#8791a6;--text-faint:#525c72;}
@@ -533,7 +535,7 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
 .err{background:rgba(255,93,108,.12);color:var(--red);border:1px solid rgba(255,93,108,.25)}
 #adminPanel{display:none}
 #durationMenu{display:none;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
-#durationMenu button{padding:18px 10px;font-size:15px;background:var(--bg-2);color:var(--text);border:1px solid var(--border)}
+#durationMenu button{padding:18px 10px;font-size:15px;background:var(--bg-2);color:var(--text);border:1px solid var(--border);margin-top:0}
 #durationMenu button b{color:var(--gold-soft);display:block;font-size:19px}
 #durationMenu button span{font-size:10.5px;color:var(--text-faint);display:block;margin-top:3px}
 .quick-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
@@ -546,20 +548,18 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
 .result-box{background:rgba(47,217,168,.06);border:1px solid rgba(47,217,168,.3);border-radius:14px;padding:14px;margin-top:12px;display:none}
 .result-box h3{color:var(--emerald);font-family:'Sora',sans-serif;font-size:13px;margin-bottom:10px}
 .result-key{font-family:'JetBrains Mono',monospace;font-size:14px;color:var(--gold-soft);background:rgba(0,0,0,.3);padding:10px;border-radius:8px;margin-bottom:10px;word-break:break-all;text-align:center;font-weight:600}
-.link-item{padding:10px;background:rgba(0,0,0,.3);border-radius:8px;margin-bottom:6px;font-size:12px}
-.link-item .step-label{color:var(--text-faint);font-size:10px;text-transform:uppercase;margin-bottom:4px}
-.link-item .step-url{color:#c7bfff;word-break:break-all;font-family:'JetBrains Mono',monospace;font-size:11px}
-.link-item .step-type{display:inline-block;padding:2px 6px;border-radius:4px;font-size:9px;font-weight:600;margin-left:6px}
-.type-link4m{background:rgba(138,124,255,.2);color:#c7bfff}
-.type-trafficvn{background:rgba(255,183,90,.2);color:#ffb75a}
+.result-keys-list{max-height:200px;overflow-y:auto;background:rgba(0,0,0,.3);border-radius:8px;padding:10px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--gold-soft);margin-bottom:10px;white-space:pre-line;word-break:break-all}
 .hint{color:var(--text-faint);font-size:11px;text-align:center;margin-top:26px}
 .status-badge{display:inline-flex;align-items:center;gap:5px;font-size:10px;padding:3px 8px;border-radius:10px;margin-left:8px}
 .status-online{background:rgba(47,217,168,.15);color:var(--emerald);border:1px solid rgba(47,217,168,.3)}
 .status-offline{background:rgba(255,93,108,.15);color:var(--red);border:1px solid rgba(255,93,108,.3)}
+.count-row{display:flex;align-items:center;gap:10px;margin-top:8px}
+.count-row label{margin:0;flex-shrink:0}
+.count-row input{margin:0}
 </style>
 </head><body>
 <div class="wrap">
-<h1>NETSUPER</h1>
+<h1>NetSuper</h1>
 <div class="tagline">Cổng lấy key cao cấp — nhanh, an toàn, minh bạch<span id="redisBadge"></span></div>
 
 <div class="card">
@@ -585,15 +585,28 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
 <input id="m" type="number" placeholder="m" value="0">
 <input id="s" type="number" placeholder="s" value="0">
 </div>
-<button class="btn-green" onclick="createKey()">CREATE KEY + GET LINKS</button>
+<button class="btn-green" onclick="createKey()">CREATE KEY</button>
 
-<div class="section-title">QUICK CREATE</div>
+<div class="section-title">QUICK CREATE (SINGLE)</div>
 <div class="quick-grid">
-<button onclick="quickCreate('3h')"><b>3H</b><span>1 click</span></button>
-<button onclick="quickCreate('6h')"><b>6H</b><span>1 click</span></button>
-<button onclick="quickCreate('8h')"><b>8H</b><span>1 click</span></button>
-<button onclick="quickCreate('12h')"><b>12H</b><span>1 click</span></button>
-<button class="wide" onclick="quickCreate('24h')"><b>24H</b><span>1 click</span></button>
+<button onclick="quickCreate('3h')"><b>3H</b><span>1 key</span></button>
+<button onclick="quickCreate('6h')"><b>6H</b><span>1 key</span></button>
+<button onclick="quickCreate('8h')"><b>8H</b><span>1 key</span></button>
+<button onclick="quickCreate('12h')"><b>12H</b><span>1 key</span></button>
+<button class="wide" onclick="quickCreate('24h')"><b>24H</b><span>1 key</span></button>
+</div>
+
+<div class="section-title">BULK CREATE (NHIỀU KEY)</div>
+<div class="count-row">
+<label style="font-size:11px;color:var(--text-faint)">Số lượng:</label>
+<input id="bulkCount" type="number" value="10" min="1" max="10000" style="padding:10px">
+</div>
+<div class="quick-grid" style="margin-top:8px">
+<button onclick="bulkCreate('3h')"><b>3H</b><span>tạo hàng loạt</span></button>
+<button onclick="bulkCreate('6h')"><b>6H</b><span>tạo hàng loạt</span></button>
+<button onclick="bulkCreate('8h')"><b>8H</b><span>tạo hàng loạt</span></button>
+<button onclick="bulkCreate('12h')"><b>12H</b><span>tạo hàng loạt</span></button>
+<button class="wide" onclick="bulkCreate('24h')"><b>24H</b><span>tạo hàng loạt</span></button>
 </div>
 
 <div id="msg"></div>
@@ -601,19 +614,20 @@ td.r{color:var(--emerald);font-family:'JetBrains Mono',monospace}
 <div id="resultBox" class="result-box">
 <h3>✅ Key Created</h3>
 <div class="result-key" id="resultKey"></div>
-<div id="resultLinks"></div>
+<div id="resultKeysList" class="result-keys-list" style="display:none"></div>
 <button class="btn-purple" style="margin-top:10px" onclick="copyAllResult()">📋 COPY ALL</button>
 </div>
 
 <table id="tbl"><thead><tr><th>KEY</th><th>REMAIN</th><th>EXPIRE</th><th></th></tr></thead><tbody></tbody></table>
 </div>
 
-<div class="hint">✦ Crafted by ThichLenDo · v2.3 ✦</div>
+<div class="hint">✦ Crafted by ThichLenDo · v3.0 ✦</div>
 </div>
 
 <script>
 let keysData = [];
 let lastResult = null;
+const MAX_SHOW_KEYS = 20;
 
 (async () => {
   try {
@@ -710,25 +724,26 @@ function showMsg(t, ok) {
   const m = document.getElementById('msg');
   m.textContent = t; m.className = ok ? 'ok' : 'err';
   m.style.display = 'block';
-  setTimeout(() => m.style.display = 'none', 3500);
+  setTimeout(() => m.style.display = 'none', 4000);
 }
-function showResult(key, expire, links) {
-  lastResult = { key, expire, links };
+function showResult(data) {
+  lastResult = data;
   document.getElementById('resultBox').style.display = 'block';
-  document.getElementById('resultKey').textContent = key;
-  const box = document.getElementById('resultLinks');
-  box.innerHTML = '';
-  if (links && links.length) {
-    links.forEach((lnk, i) => {
-      const div = document.createElement('div');
-      div.className = 'link-item';
-      const typeLabel = lnk.type === 'link4m' ? 'LINK4M' : 'TRAFFICVN';
-      const typeCls = lnk.type === 'link4m' ? 'type-link4m' : 'type-trafficvn';
-      div.innerHTML = '<div class="step-label">Step '+(i+1)+'/'+links.length+' <span class="step-type '+typeCls+'">'+typeLabel+'</span></div><div class="step-url">'+lnk.url+'</div>';
-      box.appendChild(div);
-    });
+  const keyBox = document.getElementById('resultKey');
+  const listBox = document.getElementById('resultKeysList');
+
+  if (data.keys && data.keys.length > 1) {
+    keyBox.textContent = '✅ ' + data.keys.length + ' KEYS (' + data.duration.toUpperCase() + ')';
+    const show = data.keys.slice(0, MAX_SHOW_KEYS);
+    let txt = show.join('\\n');
+    if (data.keys.length > MAX_SHOW_KEYS) {
+      txt += '\\n\\n... và ' + (data.keys.length - MAX_SHOW_KEYS) + ' keys nữa (bấm COPY ALL)';
+    }
+    listBox.textContent = txt;
+    listBox.style.display = 'block';
   } else {
-    box.innerHTML = '<div style="color:#666;font-size:11px;text-align:center">No link needed</div>';
+    keyBox.textContent = data.key || (data.keys && data.keys[0]);
+    listBox.style.display = 'none';
   }
 }
 async function createKey() {
@@ -737,37 +752,65 @@ async function createKey() {
   const minutes = document.getElementById('m').value || 0;
   const seconds = document.getElementById('s').value || 0;
   if (!content) return showMsg('NO CONTENT', false);
-  showMsg('Creating key + links...', true);
+  showMsg('Creating...', true);
   const r = await fetch('/api/create-key', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content, hours, minutes, seconds})});
   const j = await r.json();
   if (j.ok) {
     showMsg('✅ OK', true);
-    showResult(j.key, j.expire, j.links || []);
+    showResult({ key: j.key, keys: [j.key], duration: 'custom', expire: j.expire });
     keysData.push({ key: j.key, expireAt: j.expireAt, expire: j.expire });
     renderKeysTable(keysData);
   } else showMsg('FAIL', false);
 }
 async function quickCreate(duration) {
-  showMsg('Creating ' + duration.toUpperCase() + ' key + links...', true);
+  showMsg('Creating ' + duration.toUpperCase() + '...', true);
   const r = await fetch('/api/quick-create', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({duration})});
   const j = await r.json();
   if (j.ok) {
     showMsg('✅ ' + j.key, true);
-    showResult(j.key, j.expire, j.links || []);
+    showResult({ key: j.key, keys: [j.key], duration, expire: j.expire });
     keysData.push({ key: j.key, expireAt: j.expireAt, expire: j.expire });
     renderKeysTable(keysData);
     try { await navigator.clipboard.writeText(j.key); } catch (e) {}
-  } else showMsg('FAIL: ' + (j.message || 'unknown'), false);
+  } else showMsg('FAIL: ' + (j.message || ''), false);
+}
+async function bulkCreate(duration) {
+  const countEl = document.getElementById('bulkCount');
+  const count = parseInt(countEl.value, 10) || 1;
+  if (count < 1) return showMsg('Số lượng phải >= 1', false);
+  if (count > 10000) return showMsg('Tối đa 10,000 key/lần', false);
+
+  showMsg('Đang tạo ' + count + ' key ' + duration.toUpperCase() + '...', true);
+  const r = await fetch('/api/bulk-create', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({duration, count})
+  });
+  const j = await r.json();
+  if (j.ok) {
+    showMsg('✅ Đã tạo ' + j.count + ' key ' + duration.toUpperCase(), true);
+    showResult({
+      keys: j.keys,
+      duration: j.duration,
+      expire: j.expire,
+      count: j.count
+    });
+    // Thêm vào bảng keysData
+    j.keys.forEach(k => keysData.push({ key: k, expireAt: j.expireAt, expire: j.expire }));
+    renderKeysTable(keysData);
+    try { await navigator.clipboard.writeText(j.keys.join('\\n')); } catch (e) {}
+  } else showMsg('FAIL: ' + (j.message || ''), false);
 }
 function copyAllResult() {
   if (!lastResult) return;
-  let txt = '🔑 KEY: ' + lastResult.key + '\\n';
-  txt += '⏱️ Expire: ' + lastResult.expire + '\\n\\n';
-  if (lastResult.links && lastResult.links.length) {
-    txt += '📋 STEPS:\\n';
-    lastResult.links.forEach((lnk, i) => {
-      txt += (i+1) + '. [' + lnk.type.toUpperCase() + '] ' + lnk.url + '\\n';
-    });
+  let txt = '';
+  if (lastResult.keys && lastResult.keys.length > 1) {
+    txt = '🔑 ' + lastResult.keys.length + ' KEYS [' + (lastResult.duration||'').toUpperCase() + ']\\n';
+    txt += '⏱️ Expire: ' + lastResult.expire + '\\n\\n';
+    txt += lastResult.keys.join('\\n');
+  } else {
+    txt = '🔑 KEY: ' + (lastResult.key || lastResult.keys[0]) + '\\n';
+    txt += '⏱️ Expire: ' + lastResult.expire + '\\n';
   }
   navigator.clipboard.writeText(txt).then(() => showMsg('✅ Copied!', true));
 }
@@ -894,4 +937,4 @@ polling = setInterval(refresh, 3000);
 
 // ============================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('✅ Server running on port ' + PORT));
+app.listen(PORT, () => console.log('✅ NetSuper running on port ' + PORT));
