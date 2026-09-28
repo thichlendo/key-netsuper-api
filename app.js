@@ -52,6 +52,29 @@ const MAX_BULK = 10000;
 const PERMANENT_TTL_SEC = 10 * 365 * 24 * 3600;
 const PERMANENT_EXPIRE_AT = () => Date.now() + PERMANENT_TTL_SEC * 1000;
 
+// ⭐ Giới hạn số lần lấy key (public get-key flow) cho mỗi IP — vĩnh viễn, không reset
+const IP_GETKEY_LIMIT = 2;
+
+// ⭐ Số bước tối đa cho phép cấu hình theo từng mốc thời gian (chống spam quá nhiều bước)
+const DURATION_MAX_STEPS = { '3h': 1, '6h': 2, '8h': 3, '12h': 4, '24h': 5 };
+const DURATION_HOURS = { '3h': 3, '6h': 6, '8h': 8, '12h': 12, '24h': 24 };
+
+function defaultAppDurations() {
+    return {
+        '3h':  { hidden: false, maintenance: false, steps: ['link4m'] },
+        '6h':  { hidden: false, maintenance: false, steps: ['link4m', 'trafficvn'] },
+        '8h':  { hidden: false, maintenance: false, steps: ['link4m', 'trafficvn', 'trafficvn'] },
+        '12h': { hidden: false, maintenance: false, steps: ['link4m', 'trafficvn', 'trafficvn', 'trafficvn'] },
+        '24h': { hidden: false, maintenance: false, steps: ['link4m', 'trafficvn', 'trafficvn', 'trafficvn', 'trafficvn'] }
+    };
+}
+function defaultAppsConfig() {
+    return {
+        netsuper:    { label: 'NetSuper',    durations: defaultAppDurations() },
+        netsupervip: { label: 'NetSuperVip', durations: defaultAppDurations() }
+    };
+}
+
 // ============================================
 // REDIS
 // ============================================
@@ -201,6 +224,68 @@ function isWhitelistedIP(ip) { return whitelistCache.has(ip); }
 // Load persisted config/whitelist once Redis is reachable
 loadSiteConfig();
 loadWhitelist();
+
+// ============================================
+// APPS CONFIG (NetSuper / NetSuperVip — durations: hidden / maintenance / steps)
+// ============================================
+let appsConfigCache = defaultAppsConfig();
+
+async function loadAppsConfig() {
+    const raw = await redis('GET', 'ns:appsconfig');
+    if (raw) {
+        try {
+            const parsed = JSON.parse(raw);
+            // merge shallowly so any newly-added apps/durations still have defaults
+            const merged = defaultAppsConfig();
+            for (const appId of Object.keys(merged)) {
+                if (parsed[appId]) {
+                    if (parsed[appId].label) merged[appId].label = parsed[appId].label;
+                    for (const dur of Object.keys(merged[appId].durations)) {
+                        if (parsed[appId].durations && parsed[appId].durations[dur]) {
+                            merged[appId].durations[dur] = { ...merged[appId].durations[dur], ...parsed[appId].durations[dur] };
+                        }
+                    }
+                }
+            }
+            appsConfigCache = merged;
+        } catch (e) {}
+    }
+}
+async function saveAppsConfig() {
+    await redis('SET', 'ns:appsconfig', JSON.stringify(appsConfigCache));
+}
+function sanitizeSteps(steps, duration) {
+    const max = DURATION_MAX_STEPS[duration] || 5;
+    if (!Array.isArray(steps)) return null;
+    const clean = steps.filter(s => s === 'link4m' || s === 'trafficvn');
+    if (clean.length < 1 || clean.length > max) return null;
+    return clean;
+}
+loadAppsConfig();
+
+// ============================================
+// PER-IP GET-KEY COUNTER (vĩnh viễn, không reset)
+// ============================================
+async function getIpGetKeyCount(ip) {
+    const v = await redis('HGET', 'ns:ip:getkeycount', ip);
+    return parseInt(v, 10) || 0;
+}
+async function incrIpGetKeyCount(ip) {
+    return await redis('HINCRBY', 'ns:ip:getkeycount', ip, 1);
+}
+
+// ============================================
+// ANTI-REPLAY: dùng lại link/log cũ để né bước
+// ============================================
+const usedStepNonces = new Map(); // nonce -> timestamp, dùng để chặn tái sử dụng link cũ
+function rememberNonce(n) {
+    usedStepNonces.set(n, Date.now());
+    if (usedStepNonces.size > 20000) {
+        const cutoff = Date.now() - 24 * 3600 * 1000;
+        for (const [k, t] of usedStepNonces) if (t < cutoff) usedStepNonces.delete(k);
+    }
+}
+function isNonceUsed(n) { return usedStepNonces.has(n); }
 
 // ============================================
 // HELPERS
@@ -368,33 +453,44 @@ app.get('/api/check-key', async (req, res) => {
 // ============================================
 // API: start-task
 // ============================================
-app.post('/api/start-task', (req, res) => {
+app.post('/api/start-task', async (req, res) => {
     const clientIP = getClientIP(req);
-    if (isIPBlacklisted(clientIP) && !isAdminIP(req)) return res.status(429).json({ ok:false, reason:'IP blocked' });
-    if (isIPRateLimited(clientIP) && !isAdminIP(req)) return res.status(429).json({ ok:false, reason:'Rate limited' });
+    const admin = isAdminIP(req);
+    if (isIPBlacklisted(clientIP) && !admin) return res.status(429).json({ ok:false, reason:'IP blocked' });
+    if (isIPRateLimited(clientIP) && !admin) return res.status(429).json({ ok:false, reason:'Rate limited' });
+    if (siteConfigCache.status !== 'online' && !admin) return res.status(423).json({ ok:false, message:'site_unavailable' });
 
     const { duration } = req.body;
-    const config = DURATION_CONFIG[duration];
-    if (!config) return res.status(400).json({ ok: false, message: 'bad_duration' });
+    const appId = (req.body.app === 'netsupervip') ? 'netsupervip' : 'netsuper';
+    const appCfg = appsConfigCache[appId];
+    const durCfg = appCfg && appCfg.durations[duration];
+    if (!durCfg) return res.status(400).json({ ok: false, message: 'bad_duration' });
+    if (!admin && durCfg.hidden) return res.status(400).json({ ok: false, message: 'duration_hidden' });
+    if (!admin && durCfg.maintenance) return res.status(423).json({ ok: false, message: 'duration_maintenance' });
+
+    if (!admin) {
+        const used = await getIpGetKeyCount(clientIP);
+        if (used >= IP_GETKEY_LIMIT) return res.status(429).json({ ok: false, message: 'ip_limit', limit: IP_GETKEY_LIMIT, used });
+    }
 
     const token = genToken();
     tasks.set(token, {
-        duration,
-        steps: config.steps.slice(),
-        hours: config.hours,
-        maxDevices: config.devices,        // ⭐ LUÔN = 1
-        currentStep: 0, completedSteps: 0, totalSteps: config.steps.length,
+        duration, app: appId,
+        steps: durCfg.steps.slice(),
+        hours: DURATION_HOURS[duration],
+        maxDevices: 1,        // ⭐ LUÔN = 1
+        currentStep: 0, completedSteps: 0, totalSteps: durCfg.steps.length,
         done: false, key: null, keyExpire: null,
         createdAt: Date.now(),
         clientIP, clientUA: req.headers['user-agent'] || '',
-        isAdmin: isAdminIP(req),
-        stepStartedAt: 0, stepIP: '', stepUA: '',
+        isAdmin: admin,
+        stepStartedAt: 0, stepIP: '', stepUA: '', stepNonce: null,
         bypassed: false, bypassReason: null, callbackHistory: []
     });
     logIPTask(clientIP);
     setTimeout(() => tasks.delete(token), 30 * 60 * 1000);
 
-    return res.json({ ok: true, token, duration, totalSteps: config.steps.length, maxDevices: config.devices, taskUrl: `${SERVER_URL}/task?token=${token}` });
+    return res.json({ ok: true, token, duration, app: appId, totalSteps: durCfg.steps.length, maxDevices: 1, taskUrl: `${SERVER_URL}/task?token=${token}` });
 });
 
 // ============================================
@@ -404,7 +500,7 @@ app.get('/api/task-status', (req, res) => {
     const task = tasks.get(req.query.token);
     if (!task) return res.status(404).json({ ok: false });
     return res.json({
-        ok: true, duration: task.duration, progress: task.completedSteps, total: task.totalSteps,
+        ok: true, duration: task.duration, app: task.app, progress: task.completedSteps, total: task.totalSteps,
         currentStep: task.currentStep, steps: task.steps, done: task.done,
         key: task.done ? task.key : null, keyExpire: task.keyExpire, hours: task.hours,
         maxDevices: task.maxDevices || 0,
@@ -423,7 +519,9 @@ app.get('/api/continue-task', async (req, res) => {
     const step = task.currentStep;
     if (step >= task.steps.length) return res.json({ ok: false });
     const type = task.steps[step];
-    const cb = `${SERVER_URL}/api/step-callback?token=${req.query.token}&step=${step}&r=${Date.now()}`;
+    const nonce = genToken();
+    task.stepNonce = nonce;
+    const cb = `${SERVER_URL}/api/step-callback?token=${req.query.token}&step=${step}&n=${nonce}&r=${Date.now()}`;
     task.stepStartedAt = Date.now();
     task.stepIP = getClientIP(req);
     task.stepUA = req.headers['user-agent'] || '';
@@ -436,39 +534,55 @@ app.get('/api/continue-task', async (req, res) => {
 // API: step-callback
 // ============================================
 app.get('/api/step-callback', async (req, res) => {
-    const { token, step } = req.query;
+    const { token, step, n } = req.query;
     const task = tasks.get(token);
     if (!task) return res.status(403).send('invalid');
     const stepNum = parseInt(step, 10);
     if (stepNum !== task.currentStep) return res.redirect(`${SERVER_URL}/task?token=${token}`);
 
     const cbKey = `${task.duration}-${stepNum}`;
-    if (!task.callbackHistory.includes(cbKey)) task.callbackHistory.push(cbKey);
     const type = task.steps[stepNum];
 
     if (!task.isAdmin) {
+        // Chống trick: link/callback dùng log/lịch sử cũ để né bước
+        const nonceInvalid = !n || n !== task.stepNonce || isNonceUsed(n);
+        const replaySeen = task.callbackHistory.includes(cbKey);
         const check = detectBypass(req, task, type);
-        if (check.bypass) {
+        const bypassReasons = check.reasons.slice();
+        if (nonceInvalid) bypassReasons.push('Link không hợp lệ hoặc đã được dùng trước đó (log/replay)');
+        if (replaySeen) bypassReasons.push('Replay detected');
+        if (nonceInvalid || replaySeen || check.bypass) {
             task.bypassed = true;
-            task.bypassReason = `Bypass ${type}. ${check.reasons.join(' | ')}`;
+            task.bypassReason = `Bypass ${type}. ${bypassReasons.join(' | ')}`;
             markIPBlacklisted(getClientIP(req));
-            bypassLog.unshift({ time: vnTime(new Date()), ip: check.details.ip, ua: check.details.ua, duration: task.duration, step: stepNum+1, total: task.totalSteps, type, reasons: check.reasons, elapsed: check.details.elapsed });
+            bypassLog.unshift({ time: vnTime(new Date()), ip: check.details.ip, ua: check.details.ua, duration: task.duration, step: stepNum+1, total: task.totalSteps, type, reasons: bypassReasons, elapsed: check.details.elapsed });
             if (bypassLog.length > 100) bypassLog.pop();
             return res.redirect(`${SERVER_URL}/task?token=${token}`);
         }
+        rememberNonce(n);
     }
+    if (!task.callbackHistory.includes(cbKey)) task.callbackHistory.push(cbKey);
 
     task.completedSteps++;
     task.currentStep++;
-    task.stepStartedAt = 0; task.stepIP = ''; task.stepUA = '';
+    task.stepStartedAt = 0; task.stepIP = ''; task.stepUA = ''; task.stepNonce = null;
 
     if (task.completedSteps >= task.totalSteps) {
+        if (!task.isAdmin) {
+            const used = await getIpGetKeyCount(task.clientIP);
+            if (used >= IP_GETKEY_LIMIT) {
+                task.bypassed = true;
+                task.bypassReason = 'Đã đạt giới hạn số lần lấy key cho IP này';
+                return res.redirect(`${SERVER_URL}/task?token=${token}`);
+            }
+        }
         const key = genKey();
         const expireAt = Date.now() + task.hours * 3600 * 1000;
         await saveKeyToRedis(key, expireAt, task.maxDevices || 0);
         task.key = key;
         task.keyExpire = vnTime(new Date(expireAt));
         task.done = true;
+        if (!task.isAdmin) await incrIpGetKeyCount(task.clientIP);
     }
 
     res.redirect(`${SERVER_URL}/task?token=${token}`);
@@ -523,6 +637,53 @@ app.post('/api/whitelist-remove', async (req, res) => {
 app.post('/api/whitelist-list', (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
     return res.json({ ok: true, ips: Array.from(whitelistCache), yourIp: getClientIP(req) });
+});
+
+// ---- Apps config (public read: dùng để render trang Get Key) ----
+app.get('/api/apps-config', (req, res) => {
+    const admin = isAdmin(req);
+    const out = {};
+    for (const appId of Object.keys(appsConfigCache)) {
+        const a = appsConfigCache[appId];
+        out[appId] = { label: a.label, durations: {} };
+        for (const dur of Object.keys(a.durations)) {
+            const d = a.durations[dur];
+            // Người dùng thường không cần thấy các key đang ẩn (trừ admin, để còn quản lý)
+            if (!admin && d.hidden) continue;
+            out[appId].durations[dur] = {
+                hidden: d.hidden, maintenance: d.maintenance,
+                steps: d.steps, totalSteps: d.steps.length,
+                hours: DURATION_HOURS[dur], maxSteps: DURATION_MAX_STEPS[dur]
+            };
+        }
+    }
+    res.json({ ok: true, apps: out, isAdmin: admin });
+});
+
+// ---- Apps config (admin write) ----
+app.post('/api/apps-config', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
+    const { app: appId, duration, hidden, maintenance, steps } = req.body;
+    if (!appsConfigCache[appId] || !appsConfigCache[appId].durations[duration]) {
+        return res.json({ ok: false, message: 'bad_app_or_duration' });
+    }
+    const durCfg = appsConfigCache[appId].durations[duration];
+    if (typeof hidden === 'boolean') durCfg.hidden = hidden;
+    if (typeof maintenance === 'boolean') durCfg.maintenance = maintenance;
+    if (steps !== undefined) {
+        const clean = sanitizeSteps(steps, duration);
+        if (!clean) return res.json({ ok: false, message: 'bad_steps', maxSteps: DURATION_MAX_STEPS[duration] });
+        durCfg.steps = clean;
+    }
+    await saveAppsConfig();
+    return res.json({ ok: true, app: appId, duration, config: durCfg });
+});
+
+// ---- IP get-key usage (public, để hiển thị số lượt còn lại) ----
+app.get('/api/ip-getkey-status', async (req, res) => {
+    const admin = isAdmin(req);
+    const used = admin ? 0 : await getIpGetKeyCount(getClientIP(req));
+    res.json({ ok: true, used, limit: IP_GETKEY_LIMIT, unlimited: admin });
 });
 
 app.post('/api/create-key', async (req, res) => {
@@ -1950,8 +2111,10 @@ ${THEME_BG}
 <span class="brand-name">ThichLenDo</span>
 </a>
 <span style="display:flex;gap:8px;align-items:center">
+<span style="display:flex;gap:8px;align-items:center">
 <span id="statusDot" class="status-dot online"><i></i>ONLINE</span>
 <span id="redisBadge"></span>
+<button id="langBtn" class="pill" onclick="toggleLang()" style="cursor:pointer">EN</button>
 </span>
 </header>
 
@@ -1959,14 +2122,14 @@ ${THEME_BG}
 
 <section class="hero">
 <h1>NetSuper</h1>
-<p class="tagline">Cổng lấy key cao cấp — nhanh, an toàn, minh bạch</p>
+<p class="tagline" data-i18n="tagline">Cổng lấy key cao cấp — nhanh, an toàn, minh bạch</p>
 
 <div class="ticket-wrap" aria-hidden="true">
 <div class="ticket">
 <div class="ticket-main">
 <span class="ticket-label">Access key</span>
 <div class="ticket-code">NetSuper-<em>•••••••••••</em>-<em>••••••••••</em></div>
-<span class="ticket-meta">1 thiết bị · Hiệu lực 3 – 24 giờ</span>
+<span class="ticket-meta" data-i18n="ticketMeta">1 thiết bị · Hiệu lực 3 – 24 giờ</span>
 </div>
 <div class="ticket-stub">
 <span>
@@ -1977,9 +2140,9 @@ ${THEME_BG}
 </div>
 
 <ul class="perks">
-<li><i></i>1 thiết bị cho mỗi key</li>
-<li><i></i>Hiệu lực 3 – 24 giờ</li>
-<li><i></i>Nhận key sau khi xong nhiệm vụ</li>
+<li><i></i><span data-i18n="perk1">1 thiết bị cho mỗi key</span></li>
+<li><i></i><span data-i18n="perk2">Hiệu lực 3 – 24 giờ</span></li>
+<li><i></i><span data-i18n="perk3">Nhận key sau khi xong nhiệm vụ</span></li>
 </ul>
 </section>
 
@@ -1991,22 +2154,23 @@ ${THEME_BG}
 <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M17 6l3 3M14.5 8.5l2 2"/></svg>
 </span>
 <div>
-<h2>Get Key</h2>
-<p class="card-sub">Chọn thời lượng và hoàn thành nhiệm vụ để nhận key</p>
+<h2 data-i18n="getKeyTitle">Get Key</h2>
+<p class="card-sub" data-i18n="getKeySub">Chọn thời lượng và hoàn thành nhiệm vụ để nhận key</p>
 </div>
 </div>
-<button class="btn-purple" onclick="toggleMenu()" id="getKeyBtn">GET KEY</button>
-<div id="durationMenu">
-<button onclick="startTask('3h')"><b>3H</b><span>1 device</span></button>
-<button onclick="startTask('6h')"><b>6H</b><span>1 device</span></button>
-<button onclick="startTask('8h')"><b>8H</b><span>1 device</span></button>
-<button onclick="startTask('12h')"><b>12H</b><span>1 device</span></button>
-<button onclick="startTask('24h')"><b>24H</b><span>1 device</span></button>
+
+<div class="tab-bar" id="appTabs">
+<button id="tabApp-netsuper" class="active" onclick="switchApp('netsuper')">NetSuper</button>
+<button id="tabApp-netsupervip" onclick="switchApp('netsupervip')">NetSuperVip</button>
 </div>
+
+<div id="appDurationBox"><p class="card-sub" data-i18n="loading">Đang tải...</p></div>
+<div id="ipLimitNote" class="card-sub" style="margin-top:8px"></div>
 <div id="getKeyStatus" style="display:none"></div>
 </div>
 
 <div class="card" id="adminPanel">
+
 <div class="card-head">
 <span class="card-icon warm">
 <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 6v6c0 4.5 3.2 7.8 8 9 4.8-1.2 8-4.5 8-9V6z"/><path d="m9 12 2 2 4-4"/></svg>
@@ -2037,6 +2201,13 @@ ${THEME_BG}
 <button class="btn-green" style="margin-top:0" onclick="addWhitelistIp()">THÊM</button>
 </div>
 <div id="whitelistList" style="margin-top:10px"></div>
+
+<div class="section-title">GET KEY THEO APP (NetSuper / NetSuperVip)</div>
+<div class="tab-bar" style="margin-bottom:10px">
+<button id="tabAdminApp-netsuper" class="active" onclick="switchAdminApp('netsuper')">NetSuper</button>
+<button id="tabAdminApp-netsupervip" onclick="switchAdminApp('netsupervip')">NetSuperVip</button>
+</div>
+<div id="adminAppDurations"></div>
 
 <label>Key Content</label>
 <input id="content" placeholder="VIP-ABC">
@@ -2187,6 +2358,70 @@ ${THEME_BG}
 </main>
 
 <script>
+// ---------- I18N (VI / EN) ----------
+const I18N = {
+  vi: {
+    tagline: 'Cổng lấy key cao cấp — nhanh, an toàn, minh bạch',
+    ticketMeta: '1 thiết bị · Hiệu lực 3 – 24 giờ',
+    perk1: '1 thiết bị cho mỗi key',
+    perk2: 'Hiệu lực 3 – 24 giờ',
+    perk3: 'Nhận key sau khi xong nhiệm vụ',
+    getKeyTitle: 'Get Key',
+    getKeySub: 'Chọn thời lượng và hoàn thành nhiệm vụ để nhận key',
+    loading: 'Đang tải...',
+    steps: 'bước',
+    maintenanceShort: 'Bảo trì',
+    noDurations: 'Hiện chưa có mốc thời gian nào khả dụng',
+    starting: 'Đang bắt đầu...',
+    opening: 'Đang mở liên kết...',
+    error: 'Lỗi',
+    ipLimitReached: 'IP của bạn đã đạt giới hạn {limit} lần lấy key',
+    durationMaintenance: 'Mốc thời gian này đang bảo trì',
+    durationUnavailable: 'Mốc thời gian này hiện không khả dụng',
+    siteUnavailable: 'Website đang bảo trì / tạm ngưng',
+    ipLimitNote: 'Bạn đã dùng {used}/{limit} lượt lấy key',
+    ipLimitAdmin: 'Tài khoản admin — không giới hạn lượt lấy key'
+  },
+  en: {
+    tagline: 'Premium key gateway — fast, safe, transparent',
+    ticketMeta: '1 device · Valid 3 – 24 hours',
+    perk1: '1 device per key',
+    perk2: 'Valid 3 – 24 hours',
+    perk3: 'Key revealed after finishing tasks',
+    getKeyTitle: 'Get Key',
+    getKeySub: 'Pick a duration and finish the tasks to get your key',
+    loading: 'Loading...',
+    steps: 'steps',
+    maintenanceShort: 'Maintenance',
+    noDurations: 'No durations available right now',
+    starting: 'Starting...',
+    opening: 'Opening link...',
+    error: 'Error',
+    ipLimitReached: 'Your IP already reached the {limit}-key limit',
+    durationMaintenance: 'This duration is under maintenance',
+    durationUnavailable: 'This duration is not available right now',
+    siteUnavailable: 'Site is under maintenance / offline',
+    ipLimitNote: 'You have used {used}/{limit} key requests',
+    ipLimitAdmin: 'Admin account — unlimited key requests'
+  }
+};
+let currentLang = localStorage.getItem('ns_lang') || 'vi';
+function t(key) { return (I18N[currentLang] && I18N[currentLang][key]) || (I18N.vi[key] || key); }
+function applyLang() {
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    if (I18N[currentLang] && I18N[currentLang][key]) el.textContent = I18N[currentLang][key];
+  });
+  const btn = document.getElementById('langBtn');
+  if (btn) btn.textContent = currentLang === 'vi' ? 'EN' : 'VI';
+  renderAppDurations();
+}
+function toggleLang() {
+  currentLang = currentLang === 'vi' ? 'en' : 'vi';
+  localStorage.setItem('ns_lang', currentLang);
+  applyLang();
+}
+
 let keysData = [];
 let lastResult = null;
 let currentTab = 'manual';
@@ -2195,7 +2430,10 @@ let presetDuration = '';
 let deviceMode = 'unlimited';
 let bulkDeviceMode = 'unlimited';
 let bulkPresetDeviceMode = 'unlimited';
+let currentGetKeyApp = 'netsuper';
+let appsConfigData = null;
 const MAX_SHOW_KEYS = 20;
+applyLang();
 
 (async () => {
   try {
@@ -2232,6 +2470,7 @@ setInterval(refreshStatusDot, 15000);
     await syncKeys();
     await loadSiteConfigForAdmin();
     await syncWhitelist();
+    await syncAdminAppConfig();
     setInterval(updateCountdowns, 1000);
     setInterval(syncKeys, 30000);
   }
@@ -2301,6 +2540,88 @@ async function addWhitelistIp() {
   else showMsg('Lỗi thêm IP', false);
 }
 
+// ---------- ADMIN: GET KEY THEO APP (hidden / maintenance / thứ tự & số bước link) ----------
+let adminAppConfigCache = null;
+let currentAdminApp = 'netsuper';
+const DURATION_ORDER = ['3h','6h','8h','12h','24h'];
+function switchAdminApp(appId) {
+  currentAdminApp = appId;
+  document.getElementById('tabAdminApp-netsuper').classList.toggle('active', appId === 'netsuper');
+  document.getElementById('tabAdminApp-netsupervip').classList.toggle('active', appId === 'netsupervip');
+  renderAdminAppDurations();
+}
+async function syncAdminAppConfig() {
+  try {
+    const r = await fetch('/api/apps-config');
+    const j = await r.json();
+    if (!j.ok) return;
+    adminAppConfigCache = j.apps;
+    renderAdminAppDurations();
+  } catch (e) {}
+}
+function renderAdminAppDurations() {
+  const box = document.getElementById('adminAppDurations');
+  if (!box || !adminAppConfigCache) return;
+  const durations = adminAppConfigCache[currentAdminApp].durations;
+  box.innerHTML = '';
+  DURATION_ORDER.forEach(dur => {
+    const d = durations[dur];
+    const maxSteps = d.maxSteps;
+    const row = document.createElement('div');
+    row.style.cssText = 'padding:12px;margin-top:10px;border-radius:12px;background:var(--field);border:1px solid var(--line)';
+
+    const head = document.createElement('div');
+    head.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap';
+    head.innerHTML = '<b style="font-family:var(--font-mono)">' + dur.toUpperCase() + '</b>';
+
+    const toggles = document.createElement('div');
+    toggles.style.cssText = 'display:flex;gap:14px;font-size:12px;color:var(--text-dim)';
+    toggles.innerHTML =
+      '<label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" id="hid-' + currentAdminApp + '-' + dur + '" ' + (d.hidden ? 'checked' : '') + '> Ẩn</label>' +
+      '<label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" id="maint-' + currentAdminApp + '-' + dur + '" ' + (d.maintenance ? 'checked' : '') + '> Bảo trì</label>';
+    head.appendChild(toggles);
+    row.appendChild(head);
+
+    const stepsWrap = document.createElement('div');
+    stepsWrap.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;margin-top:10px';
+    stepsWrap.id = 'steps-' + currentAdminApp + '-' + dur;
+    for (let i = 0; i < maxSteps; i++) {
+      const sel = document.createElement('select');
+      sel.dataset.slot = i;
+      sel.style.cssText = 'padding:7px 8px;border-radius:8px;background:var(--ink-800);border:1px solid var(--line);color:var(--text);font-size:12px';
+      const cur = d.steps[i] || '';
+      ['', 'link4m', 'trafficvn'].forEach(opt => {
+        const o = document.createElement('option');
+        o.value = opt; o.textContent = opt === '' ? '— (không dùng)' : opt;
+        if (opt === cur) o.selected = true;
+        sel.appendChild(o);
+      });
+      stepsWrap.appendChild(sel);
+    }
+    row.appendChild(stepsWrap);
+    row.innerHTML += '<p class="card-sub" style="margin-top:6px">Tối đa ' + maxSteps + ' bước · thứ tự trái → phải · để trống để rút ngắn</p>';
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'btn-purple';
+    saveBtn.style.cssText = 'margin-top:8px;padding:9px 14px;font-size:12.5px';
+    saveBtn.textContent = 'LƯU ' + dur.toUpperCase();
+    saveBtn.onclick = () => saveAdminAppDuration(dur, stepsWrap);
+    row.appendChild(saveBtn);
+
+    box.appendChild(row);
+  });
+}
+async function saveAdminAppDuration(dur, stepsWrap) {
+  const hidden = document.getElementById('hid-' + currentAdminApp + '-' + dur).checked;
+  const maintenance = document.getElementById('maint-' + currentAdminApp + '-' + dur).checked;
+  const steps = Array.from(stepsWrap.querySelectorAll('select')).map(s => s.value).filter(v => v);
+  if (!steps.length) { showMsg('Cần ít nhất 1 bước', false); return; }
+  const r = await fetch('/api/apps-config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app: currentAdminApp, duration: dur, hidden, maintenance, steps})});
+  const j = await r.json();
+  if (j.ok) { showMsg('Đã lưu ' + dur.toUpperCase() + ' (' + currentAdminApp + ')', true); syncAdminAppConfig(); loadAppDurations(); }
+  else showMsg('Lỗi lưu: ' + (j.message || ''), false);
+}
+
 function formatCountdown(ms) {
   if (ms <= 0) return '00s';
   const s = Math.floor(ms/1000);
@@ -2359,21 +2680,78 @@ function renderKeysTable(list) {
     td.appendChild(b); tr.appendChild(td); tb.appendChild(tr);
   });
 }
-function toggleMenu() {
-  const m = document.getElementById('durationMenu');
-  const btn = document.getElementById('getKeyBtn');
-  if (m.style.display === 'grid') { m.style.display='none'; btn.style.display='block'; }
-  else { m.style.display='grid'; btn.style.display='none'; }
+async function loadAppDurations() {
+  try {
+    const r = await fetch('/api/apps-config');
+    const j = await r.json();
+    if (!j.ok) return;
+    appsConfigData = j.apps;
+    renderAppDurations();
+  } catch (e) {}
+  try {
+    const r2 = await fetch('/api/ip-getkey-status');
+    const j2 = await r2.json();
+    const note = document.getElementById('ipLimitNote');
+    if (j2.ok && note) {
+      note.textContent = j2.unlimited
+        ? t('ipLimitAdmin')
+        : t('ipLimitNote').replace('{used}', j2.used).replace('{limit}', j2.limit);
+    }
+  } catch (e) {}
+}
+function switchApp(appId) {
+  currentGetKeyApp = appId;
+  document.getElementById('tabApp-netsuper').classList.toggle('active', appId === 'netsuper');
+  document.getElementById('tabApp-netsupervip').classList.toggle('active', appId === 'netsupervip');
+  renderAppDurations();
+}
+function renderAppDurations() {
+  const box = document.getElementById('appDurationBox');
+  if (!box) return;
+  if (!appsConfigData || !appsConfigData[currentGetKeyApp]) { box.innerHTML = '<p class="card-sub">' + t('loading') + '</p>'; return; }
+  const durations = appsConfigData[currentGetKeyApp].durations;
+  const order = ['3h','6h','8h','12h','24h'];
+  box.innerHTML = '';
+  const grid = document.createElement('div');
+  grid.id = 'durationMenu';
+  grid.style.display = 'grid';
+  let any = false;
+  order.forEach(dur => {
+    const d = durations[dur];
+    if (!d) return; // ẩn -> không hiện
+    any = true;
+    const btn = document.createElement('button');
+    if (d.maintenance) {
+      btn.disabled = true;
+      btn.style.opacity = '.5';
+      btn.style.cursor = 'not-allowed';
+      btn.innerHTML = '<b>' + dur.toUpperCase() + '</b><span>' + t('maintenanceShort') + '</span>';
+    } else {
+      btn.onclick = () => startTask(dur);
+      btn.innerHTML = '<b>' + dur.toUpperCase() + '</b><span>' + d.totalSteps + ' ' + t('steps') + '</span>';
+    }
+    grid.appendChild(btn);
+  });
+  if (!any) { box.innerHTML = '<p class="card-sub">' + t('noDurations') + '</p>'; return; }
+  box.appendChild(grid);
 }
 async function startTask(duration) {
   const status = document.getElementById('getKeyStatus');
-  status.style.display = 'block'; status.textContent = 'Starting...'; status.style.color = '#888';
-  const r = await fetch('/api/start-task', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({duration})});
+  status.style.display = 'block'; status.textContent = t('starting'); status.style.color = '#888';
+  const r = await fetch('/api/start-task', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({duration, app: currentGetKeyApp})});
   const j = await r.json();
-  if (!j.ok) { status.textContent = 'Error: ' + (j.reason || j.message); status.style.color='#ef4444'; return; }
-  status.textContent = 'Opening...'; status.style.color = '#10b981';
+  if (!j.ok) {
+    let msg = j.message || j.reason || 'error';
+    if (msg === 'ip_limit') msg = t('ipLimitReached').replace('{limit}', j.limit);
+    else if (msg === 'duration_maintenance') msg = t('durationMaintenance');
+    else if (msg === 'duration_hidden' || msg === 'bad_duration') msg = t('durationUnavailable');
+    else if (msg === 'site_unavailable') msg = t('siteUnavailable');
+    status.textContent = t('error') + ': ' + msg; status.style.color='#ef4444'; return;
+  }
+  status.textContent = t('opening'); status.style.color = '#10b981';
   location.href = j.taskUrl;
 }
+loadAppDurations();
 
 function switchTab(t) {
   currentTab = t;
