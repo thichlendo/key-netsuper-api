@@ -9,7 +9,7 @@ app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 // ============================================
 // CONFIG
 // ============================================
-const ADMIN_IP_B64 = 'MjAwMTplZTA6NGY0ZDo1YzQwOmM1YmE6NGNjZDo5MGY0OmNmOTY=';
+const ADMIN_IP_B64 = 'MjcuNjYuMjQ4LjE1MA==';
 const ADMIN_SERIAL_B64 = 'UjlKTjYwS0VQS0o=';
 const SERVER_URL = process.env.SERVER_URL || 'https://key-netsuper-api.onrender.com';
 
