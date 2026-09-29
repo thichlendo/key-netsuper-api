@@ -484,7 +484,7 @@ function totalHoursOf(t) {
 // ============================================
 app.get('/api/check-key', async (req, res) => {
     const key = req.query.key;
-    const hwid = String(req.query.hwid || '').trim();
+    const hwid = String(req.query.hwid || req.query.device_id || '').trim();
     if (!key) return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
 
     const entry = await getKeyFromRedis(key);
