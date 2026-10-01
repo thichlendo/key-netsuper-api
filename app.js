@@ -9,41 +9,31 @@ app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 // ============================================
 // CONFIG
 // ============================================
-const ADMIN_IP_B64 = 'MjcuNjYuMjQ4LjE1MA==';
 const ADMIN_SERIAL_B64 = 'UjlKTjYwS0VQS0o=';
 const SERVER_URL = process.env.SERVER_URL || 'https://key-netsuper-api.onrender.com';
 
-function getAdminIP() {
-    try { return Buffer.from(ADMIN_IP_B64, 'base64').toString('utf8'); }
-    catch (e) { return '0.0.0.0'; }
-}
-// Chuẩn hoá IP: chữ thường, bỏ tiền tố ::ffff: (IPv4-mapped)
+// ⭐ ADMIN: vào bằng TRANG BÍ MẬT + mật khẩu (không dùng IP nữa)
+//   Đặt 2 biến môi trường trên Render:
+//     ADMIN_PATH     = đường dẫn bí mật, vd: x7k2-q9m4-panel  (chỉ gồm a-z A-Z 0-9 _ -, tối thiểu 8 ký tự)
+//     ADMIN_PASSWORD = mật khẩu admin (nên dài >= 12 ký tự)
+//   Truy cập: https://<domain>/<ADMIN_PATH>  -> nhập mật khẩu -> vào /amin/thichlendo
+//   Nếu thiếu 1 trong 2 biến thì trang bí mật bị TẮT (không ai vào được).
+const ADMIN_PATH = String(process.env.ADMIN_PATH || '').trim().replace(/^\/+|\/+$/g, '');
+const ADMIN_PASSWORD = String(process.env.ADMIN_PASSWORD || '');
+const ADMIN_SESSION_SECRET = String(process.env.ADMIN_SESSION_SECRET || ADMIN_PASSWORD);
+const ADMIN_SESSION_HOURS = 12;
+const ADMIN_COOKIE = 'ns_adm';
+const ADMIN_LOGIN_ENABLED = /^[A-Za-z0-9_-]{8,}$/.test(ADMIN_PATH) && ADMIN_PASSWORD.length >= 8;
+if (!ADMIN_LOGIN_ENABLED) console.error('⚠️ Thiếu/sai ADMIN_PATH hoặc ADMIN_PASSWORD -> trang admin bí mật đang TẮT');
+
+// Chuẩn hoá IP: chữ thường, bỏ tiền tố ::ffff: (IPv4-mapped) — dùng cho whitelist IP
 function normIP(ip) {
     return String(ip || '').trim().toLowerCase().replace(/^::ffff:/, '');
-}
-// IPv6: lấy /64 (4 nhóm đầu) vì đuôi 64 bit cuối của điện thoại/router hay đổi (privacy extensions)
-function ipv6Prefix64(ip) {
-    const n = normIP(ip);
-    if (!n.includes(':')) return null;
-    const halves = n.split('::');
-    let head = halves[0] ? halves[0].split(':') : [];
-    if (halves.length === 1) return head.length >= 4 ? head.slice(0, 4).join(':') : null;
-    return head.length >= 4 ? head.slice(0, 4).join(':') : null;
-}
-function ipMatches(ip, adminIp) {
-    const a = normIP(ip), b = normIP(adminIp);
-    if (!a || !b) return false;
-    if (a === b) return true;
-    const pa = ipv6Prefix64(a), pb = ipv6Prefix64(b);
-    return !!(pa && pb && pa === pb);
 }
 function getAdminSerial() {
     try { return Buffer.from(ADMIN_SERIAL_B64, 'base64').toString('utf8'); }
     catch (e) { return ''; }
 }
-const ADMIN_IPS = [getAdminIP()].concat(
-    String(process.env.ADMIN_IPS || '').split(',').map(x => x.trim()).filter(Boolean)
-);
 const ADMIN_SERIALS = [getAdminSerial()];
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
@@ -54,6 +44,11 @@ const LINK4M_API_KEY = '6a61ce8626fd3a13155f6529';
 const LINK4M_API_URL = 'https://link4m.co/api-shorten/v2';
 const TRAFFICVN_API_KEY = 'b19399e1906b7bad23ed21c078a1edf7';
 const TRAFFICVN_API_URL = 'https://trafficvn.com/apidevelop';
+// Link999 (token được che bằng base64, có thể ghi đè bằng env LINK999_API_KEY)
+const LINK999_API_KEY_B64 = 'ZDRmMGMyNzliZjVkMDFjOGM2M2QxMjdhOTQ5ZmVhNzcyODhiMzg2OA==';
+const LINK999_API_KEY = process.env.LINK999_API_KEY || Buffer.from(LINK999_API_KEY_B64, 'base64').toString('utf8');
+const LINK999_API_URL = 'https://link999.app/st';
+const LINK999_TYPE = String(process.env.LINK999_TYPE || '5');   // 5 = Google Search 4 Step
 
 // ⭐ User get key = LUÔN 1 DEVICE cho mọi mức
 const DURATION_CONFIG = {
@@ -74,7 +69,8 @@ const VIP_PACKAGES = {
 
 const MIN_LINK4M_MS = 80 * 1000;
 const MIN_TRAFFICVN_MS = 90 * 1000;
-const VALID_REFERERS = ['link4m.co','www.link4m.co','link4m.com','www.link4m.com','trafficvn.com','www.trafficvn.com'];
+const MIN_LINK999_MS = (Number(process.env.LINK999_MIN_SECONDS) || 90) * 1000;
+const VALID_REFERERS = ['link4m.co','www.link4m.co','link4m.com','www.link4m.com','trafficvn.com','www.trafficvn.com','link999.app','www.link999.app'];
 const BAD_UA_PATTERNS = ['curl','wget','python','okhttp','postman','insomnia','axios','node-fetch','go-http-client','java/','libwww','httpie','powershell','headlesschrome','phantomjs','selenium','puppeteer','playwright'];
 const RATE_LIMIT_WINDOW = 60 * 60 * 1000;
 const RATE_LIMIT_MAX = 5;
@@ -291,7 +287,7 @@ async function saveAppsConfig() {
 function sanitizeSteps(steps, duration) {
     const max = DURATION_MAX_STEPS[duration] || 5;
     if (!Array.isArray(steps)) return null;
-    const clean = steps.filter(s => s === 'link4m' || s === 'trafficvn');
+    const clean = steps.filter(s => s === 'link4m' || s === 'trafficvn' || s === 'link999');
     if (clean.length < 1 || clean.length > max) return null;
     return clean;
 }
@@ -334,14 +330,44 @@ function getClientIP(req) {
     if (fwd) return String(fwd).split(',')[0].trim();
     return req.ip || '';
 }
+// ---- Phiên admin: cookie ký HMAC (HttpOnly, SameSite=Strict) ----
+function parseCookies(req) {
+    const out = {};
+    String(req.headers.cookie || '').split(';').forEach(part => {
+        const i = part.indexOf('=');
+        if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    });
+    return out;
+}
+function signSession(exp) {
+    return crypto.createHmac('sha256', ADMIN_SESSION_SECRET).update('adm.' + exp).digest('hex');
+}
+function makeAdminToken() {
+    const exp = Date.now() + ADMIN_SESSION_HOURS * 3600 * 1000;
+    return exp + '.' + signSession(exp);
+}
+function safeEqualStr(a, b) {
+    const ha = crypto.createHash('sha256').update(String(a)).digest();
+    const hb = crypto.createHash('sha256').update(String(b)).digest();
+    return crypto.timingSafeEqual(ha, hb);
+}
+function isAdminSession(req) {
+    if (!ADMIN_LOGIN_ENABLED) return false;
+    const tok = parseCookies(req)[ADMIN_COOKIE];
+    if (!tok) return false;
+    const [exp, sig] = tok.split('.');
+    if (!exp || !sig || !/^\d+$/.test(exp) || Number(exp) < Date.now()) return false;
+    return safeEqualStr(sig, signSession(exp));
+}
+// Dùng cho start-task: admin đã đăng nhập hoặc IP trong whitelist (do admin thêm trong panel) được bỏ qua giới hạn
 function isAdminIP(req) {
     const ip = getClientIP(req);
-    return ADMIN_IPS.some(a => ipMatches(ip, a)) || isWhitelistedIP(ip) || isWhitelistedIP(normIP(ip));
+    return isAdminSession(req) || isWhitelistedIP(ip) || isWhitelistedIP(normIP(ip));
 }
+// Quyền quản trị thật sự: chỉ phiên đăng nhập bí mật (hoặc serial của app). Whitelist IP KHÔNG có quyền admin.
 function isAdmin(req) {
-    const ip = getClientIP(req);
     const serial = (req.body && req.body.serial) || req.query.serial;
-    return isAdminIP(req) || (serial && ADMIN_SERIALS.includes(String(serial).trim()));
+    return isAdminSession(req) || !!(serial && ADMIN_SERIALS.includes(String(serial).trim()));
 }
 function genToken() { return crypto.randomBytes(16).toString('hex'); }
 
@@ -418,7 +444,7 @@ function detectBypass(req, task, stepType) {
     const currentUA = req.headers['user-agent'] || '';
     const currentReferer = req.headers['referer'] || req.headers['referrer'] || '';
     const elapsed = Date.now() - task.stepStartedAt;
-    let minTime = stepType === 'link4m' ? MIN_LINK4M_MS : MIN_TRAFFICVN_MS;
+    let minTime = stepType === 'link4m' ? MIN_LINK4M_MS : (stepType === 'link999' ? MIN_LINK999_MS : MIN_TRAFFICVN_MS);
     if (elapsed < minTime) reasons.push(`Thời gian quá ngắn (${Math.round(elapsed/1000)}s < ${Math.round(minTime/1000)}s)`);
     if (currentIP !== task.stepIP) reasons.push('IP thay đổi');
     const uaLower = currentUA.toLowerCase();
@@ -451,6 +477,23 @@ async function genShortLink(type, cb) {
             const r = await fetch(`${LINK4M_API_URL}?${params}`);
             const j = await r.json();
             if (j.status === 'success' && j.shortenedUrl) return j.shortenedUrl;
+        } else if (type === 'link999') {
+            // Link999: /st?api=TOKEN&url=DEST&type=N  -> server redirect sang link rút gọn.
+            // Gọi từ server và đọc header Location để KHÔNG lộ token cho người dùng.
+            const params = new URLSearchParams({ api: LINK999_API_KEY, url: cb, type: LINK999_TYPE });
+            const r = await fetch(`${LINK999_API_URL}?${params}`, {
+                redirect: 'manual',
+                headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NetSuperKeyServer/1.0)' }
+            });
+            const loc = r.headers.get('location');
+            if (loc && /^https?:\/\//i.test(loc)) return loc;
+            const ct = String(r.headers.get('content-type') || '');
+            if (ct.includes('json')) {
+                const j = await r.json();
+                const u = j.shortenedUrl || j.short_url || j.url || null;
+                if (u && /^https?:\/\//i.test(u)) return u;
+            }
+            console.error('genShortLink link999: không lấy được link, status', r.status);
         } else {
             const params = new URLSearchParams({ api: TRAFFICVN_API_KEY, url: cb, fallback_url: cb });
             const r = await fetch(`${TRAFFICVN_API_URL}?${params}`);
@@ -1085,8 +1128,56 @@ function serveMainOrMaintenance(req, res) {
 app.get('/', serveMainOrMaintenance);
 app.get('/getkey', serveMainOrMaintenance);
 // Hidden admin entrance — always reaches the full page (with admin panel JS-gated) regardless of site status
-app.get('/amin/thichlendo', (req, res) => res.send(MAIN_HTML));
-app.get('/amin/keys', (req, res) => { res.set('Cache-Control', 'no-store'); res.send(KEYS_HTML); });
+function notFound(res) { return res.status(404).type('text/plain').send('Cannot GET ' + 'page'); }
+app.get('/amin/thichlendo', (req, res) => {
+    if (!isAdminSession(req)) return notFound(res);
+    res.set('Cache-Control', 'no-store'); res.send(MAIN_HTML);
+});
+app.get('/amin/keys', (req, res) => {
+    if (!isAdminSession(req)) return notFound(res);
+    res.set('Cache-Control', 'no-store'); res.send(KEYS_HTML);
+});
+
+// ---- Trang đăng nhập bí mật của admin ----
+const adminLoginFails = new Map(); // ip -> { count, until }
+function adminLoginPage(msg) {
+    return `<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>.</title>
+<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0b1020;font-family:system-ui,sans-serif;color:#e5e7eb}
+form{background:#111936;border:1px solid #243056;border-radius:14px;padding:26px;width:min(92vw,340px)}
+input{width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid #2b3a6b;background:#0b1020;color:#fff;font-size:15px;margin:12px 0}
+button{width:100%;padding:12px;border:0;border-radius:10px;background:linear-gradient(135deg,#22d3ee,#8b5cf6);color:#fff;font-weight:700;font-size:15px}
+.e{color:#f87171;font-size:13px;min-height:16px}</style></head><body>
+<form method="POST" autocomplete="off"><div style="font-weight:700;font-size:17px">Admin</div>
+<input type="password" name="password" placeholder="Mật khẩu" autofocus required><div class="e">${msg || ''}</div><button type="submit">Vào</button></form></body></html>`;
+}
+if (ADMIN_LOGIN_ENABLED) {
+    app.get('/' + ADMIN_PATH, (req, res) => {
+        res.set('Cache-Control', 'no-store');
+        if (isAdminSession(req)) return res.redirect('/amin/thichlendo');
+        res.send(adminLoginPage(''));
+    });
+    app.post('/' + ADMIN_PATH, (req, res) => {
+        res.set('Cache-Control', 'no-store');
+        const ip = getClientIP(req);
+        const f = adminLoginFails.get(ip) || { count: 0, until: 0 };
+        if (f.until > Date.now()) return res.status(429).send(adminLoginPage('Thử sai quá nhiều, đợi 15 phút.'));
+        const pw = String((req.body && req.body.password) || '');
+        if (!safeEqualStr(pw, ADMIN_PASSWORD)) {
+            f.count++;
+            if (f.count >= 5) { f.until = Date.now() + 15 * 60 * 1000; f.count = 0; }
+            adminLoginFails.set(ip, f);
+            return res.status(401).send(adminLoginPage('Sai mật khẩu.'));
+        }
+        adminLoginFails.delete(ip);
+        const secure = req.secure || String(req.headers['x-forwarded-proto'] || '').includes('https');
+        res.setHeader('Set-Cookie', `${ADMIN_COOKIE}=${encodeURIComponent(makeAdminToken())}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${ADMIN_SESSION_HOURS * 3600}${secure ? '; Secure' : ''}`);
+        return res.redirect('/amin/thichlendo');
+    });
+    app.post('/api/admin-logout', (req, res) => {
+        res.setHeader('Set-Cookie', `${ADMIN_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`);
+        res.json({ ok: true });
+    });
+}
 app.get('/task', (req, res) => res.send(renderTaskPage(req.query.token || '')));
 
 // ============================================
@@ -2882,7 +2973,7 @@ function renderAdminAppDurations() {
       sel.dataset.slot = i;
       sel.style.cssText = 'padding:7px 8px;border-radius:8px;background:var(--ink-800);border:1px solid var(--line);color:var(--text);font-size:12px';
       const cur = d.steps[i] || '';
-      ['', 'link4m', 'trafficvn'].forEach(opt => {
+      ['', 'link4m', 'trafficvn', 'link999'].forEach(opt => {
         const o = document.createElement('option');
         o.value = opt; o.textContent = opt === '' ? '— (không dùng)' : opt;
         if (opt === cur) o.selected = true;
@@ -3633,7 +3724,7 @@ async function refresh() {
     if (i < j.completedSteps) { cls='done'; icon='✓'; }
     else if (i === j.currentStep) { cls='current'; icon='▶'; }
     row.className = 'step-row ' + cls;
-    const label = type === 'link4m' ? 'Link4M (80s)' : 'TrafficVN (90s)';
+    const label = type === 'link4m' ? 'Link4M (80s)' : (type === 'link999' ? 'Link999 (90s)' : 'TrafficVN (90s)');
     row.innerHTML = '<span class="step-icon">' + icon + '</span> Step ' + (i+1) + '/' + j.total + ' — ' + label;
     prog.appendChild(row);
   });
