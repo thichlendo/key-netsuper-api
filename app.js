@@ -3,8 +3,122 @@ const crypto = require('crypto');
 const app = express();
 
 app.set('trust proxy', true);
-app.use(express.json({ limit: '20mb' }));
-app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+app.disable('x-powered-by');
+
+// ============================================
+// 🛡️ BẢO MẬT: chống DDoS / flood / quét / nhúng iframe
+// ============================================
+const SEC = {
+    GLOBAL_PER_MIN: 150,          // tổng request / IP / phút
+    API_PER_MIN: 90,              // tổng /api/* / IP / phút
+    BUCKETS: {                    // giới hạn riêng từng API / IP / phút
+        '/api/start-task': 10,
+        '/api/continue-task': 15,
+        '/api/step-callback': 20,
+        '/api/check-key': 60,
+        '/api/task-status': 45,
+        '/api/site-status': 25,
+        '/api/verify-admin': 20,
+        '/api/health': 15
+    },
+    LOGIN_PER_MIN: 8,             // thử mật khẩu admin / IP / phút
+    LASTHOP_PER_MIN: 1500,        // chặn flood giả X-Forwarded-For (tính theo proxy gần nhất)
+    BAN_VIOLATIONS: 25,           // vi phạm >= 25 lần / phút -> ban
+    BAN_MS: 15 * 60 * 1000,       // thời gian ban IP
+    MAX_INFLIGHT: 500,            // số request xử lý đồng thời tối đa (người thường)
+    MAX_BODY_PUBLIC: 1024 * 1024, // body tối đa 1MB cho người thường
+    MAX_TRACKED: 100000           // chống phình RAM
+};
+const secHits = new Map();
+const secBans = new Map();
+const secViol = new Map();
+let secInflight = 0;
+
+function secHit(key, limit) {
+    const now = Date.now();
+    let h = secHits.get(key);
+    if (!h || h.reset <= now) { h = { n: 0, reset: now + 60000 }; secHits.set(key, h); }
+    h.n++;
+    return h.n > limit;
+}
+function secViolation(ip) {
+    const now = Date.now();
+    let v = secViol.get(ip);
+    if (!v || v.reset <= now) { v = { n: 0, reset: now + 60000 }; secViol.set(ip, v); }
+    v.n++;
+    if (v.n >= SEC.BAN_VIOLATIONS) { secBans.set(ip, now + SEC.BAN_MS); secViol.delete(ip); }
+}
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, h] of secHits) if (h.reset <= now) secHits.delete(k);
+    for (const [k, v] of secViol) if (v.reset <= now) secViol.delete(k);
+    for (const [k, u] of secBans) if (u <= now) secBans.delete(k);
+    if (secHits.size > SEC.MAX_TRACKED) secHits.clear();
+}, 30000).unref();
+
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    if (req.path.startsWith('/api/') || req.path.startsWith('/amin/')) res.setHeader('Cache-Control', 'no-store');
+
+    if (!['GET', 'POST', 'HEAD', 'OPTIONS'].includes(req.method)) return res.status(405).end();
+
+    const ip = getClientIP(req) || 'unknown';
+    const until = secBans.get(ip);
+    if (until && until > Date.now()) {
+        res.setHeader('Retry-After', String(Math.ceil((until - Date.now()) / 1000)));
+        return res.status(429).type('text/plain').send('Too many requests');
+    }
+
+    // Admin đã đăng nhập: không bị giới hạn
+    if (isAdminSession(req)) return next();
+
+    if (secInflight >= SEC.MAX_INFLIGHT) {
+        res.setHeader('Retry-After', '5');
+        return res.status(503).type('text/plain').send('Server busy');
+    }
+    secInflight++;
+    let counted = true;
+    const dec = () => { if (counted) { counted = false; secInflight--; } };
+    res.on('finish', dec);
+    res.on('close', dec);
+
+    const cl = parseInt(req.headers['content-length'] || '0', 10);
+    if (cl > SEC.MAX_BODY_PUBLIC) return res.status(413).json({ ok: false, reason: 'too_large' });
+
+    const path = req.path;
+    const xff = req.headers['x-forwarded-for'];
+    const lastHop = xff ? String(xff).split(',').pop().trim() : ((req.socket && req.socket.remoteAddress) || '');
+    let over = secHit('G|' + ip, SEC.GLOBAL_PER_MIN) || secHit('H|' + lastHop, SEC.LASTHOP_PER_MIN);
+    if (!over) {
+        if (ADMIN_LOGIN_ENABLED && req.method === 'POST' && path === '/' + ADMIN_PATH) {
+            over = secHit('L|' + ip, SEC.LOGIN_PER_MIN);
+        } else if (path.startsWith('/api/')) {
+            const lim = SEC.BUCKETS[path];
+            over = lim ? secHit('B|' + path + '|' + ip, lim) : false;
+            if (!over) over = secHit('A|' + ip, SEC.API_PER_MIN);
+        }
+    }
+    if (over) {
+        secViolation(ip);
+        res.setHeader('Retry-After', '30');
+        return res.status(429).json({ ok: false, reason: 'rate_limited' });
+    }
+    next();
+});
+
+// Body parser: người thường 1MB, admin đã đăng nhập 20MB
+const jsonSmall = express.json({ limit: '1mb' });
+const jsonBig = express.json({ limit: '20mb' });
+const urlSmall = express.urlencoded({ extended: true, limit: '1mb' });
+const urlBig = express.urlencoded({ extended: true, limit: '20mb' });
+app.use((req, res, next) => (isAdminSession(req) ? jsonBig : jsonSmall)(req, res, next));
+app.use((req, res, next) => (isAdminSession(req) ? urlBig : urlSmall)(req, res, next));
 
 // ============================================
 // CONFIG
@@ -330,6 +444,13 @@ function getClientIP(req) {
     if (fwd) return String(fwd).split(',')[0].trim();
     return req.ip || '';
 }
+// ---- Gắn callback với đúng trình duyệt đã bấm "Tiếp tục" (chống copy link từ log / chia sẻ link) ----
+function bindCookieName(token) { return 'ns_b_' + String(token || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 12); }
+function setBindCookie(req, res, token, secret) {
+    const secure = req.secure || String(req.headers['x-forwarded-proto'] || '').includes('https');
+    res.setHeader('Set-Cookie', `${bindCookieName(token)}=${secret}; Path=/api/step-callback; HttpOnly; SameSite=Lax; Max-Age=1800${secure ? '; Secure' : ''}`);
+}
+
 // ---- Phiên admin: cookie ký HMAC (HttpOnly, SameSite=Strict) ----
 function parseCookies(req) {
     const out = {};
@@ -628,6 +749,8 @@ app.get('/api/continue-task', async (req, res) => {
     const type = task.steps[step];
     const nonce = genToken();
     task.stepNonce = nonce;
+    task.bindSecret = genToken();
+    setBindCookie(req, res, req.query.token, task.bindSecret);
     const cb = `${SERVER_URL}/api/step-callback?token=${req.query.token}&step=${step}&n=${nonce}&r=${Date.now()}`;
     task.stepStartedAt = Date.now();
     task.stepIP = getClientIP(req);
@@ -656,9 +779,12 @@ app.get('/api/step-callback', async (req, res) => {
         const replaySeen = task.callbackHistory.includes(cbKey);
         const check = detectBypass(req, task, type);
         const bypassReasons = check.reasons.slice();
+        const bindCk = parseCookies(req)[bindCookieName(token)];
+        const bindBad = !task.bindSecret || !bindCk || !safeEqualStr(bindCk, task.bindSecret);
+        if (bindBad) bypassReasons.push('Trình duyệt không khớp phiên (link bị copy / lấy từ log)');
         if (nonceInvalid) bypassReasons.push('Link không hợp lệ hoặc đã được dùng trước đó (log/replay)');
         if (replaySeen) bypassReasons.push('Replay detected');
-        if (nonceInvalid || replaySeen || check.bypass) {
+        if (bindBad || nonceInvalid || replaySeen || check.bypass) {
             task.bypassed = true;
             task.bypassReason = `Bypass ${type}. ${bypassReasons.join(' | ')}`;
             markIPBlacklisted(getClientIP(req));
@@ -2454,6 +2580,141 @@ td.dev{
 }
 `;
 
+
+// ============================================
+// 🌐 ĐA NGÔN NGỮ (14 ngôn ngữ phổ biến) + HƯỚNG DẪN + CHỐNG XEM LOG
+// ============================================
+const LANG_LIST = [["vi", "Tiếng Việt"], ["en", "English"], ["zh", "中文"], ["es", "Español"], ["hi", "हिन्दी"], ["ar", "العربية"], ["pt", "Português"], ["ru", "Русский"], ["id", "Bahasa Indonesia"], ["ja", "日本語"], ["fr", "Français"], ["ko", "한국어"], ["th", "ไทย"], ["de", "Deutsch"]];
+const I18N_ALL = {
+  "vi": {"tagline": "Cổng lấy key cao cấp — nhanh, an toàn, minh bạch", "ticketMeta": "1 thiết bị · Hiệu lực 3 – 24 giờ", "perk1": "1 thiết bị cho mỗi key", "perk2": "Hiệu lực 3 – 24 giờ", "perk3": "Nhận key sau khi xong nhiệm vụ", "getKeyTitle": "Get Key", "getKeySub": "Chọn thời lượng và hoàn thành nhiệm vụ để nhận key", "loading": "Đang tải...", "steps": "bước", "maintenanceShort": "Bảo trì", "noDurations": "Hiện chưa có mốc thời gian nào khả dụng", "starting": "Đang bắt đầu...", "opening": "Đang mở liên kết...", "error": "Lỗi", "ipLimitReached": "IP của bạn đã đạt giới hạn {limit} lần lấy key", "durationMaintenance": "Mốc thời gian này đang bảo trì", "durationUnavailable": "Mốc thời gian này hiện không khả dụng", "siteUnavailable": "Website đang bảo trì / tạm ngưng", "ipLimitNote": "Bạn đã dùng {used}/{limit} lượt lấy key", "ipLimitAdmin": "Tài khoản admin — không giới hạn lượt lấy key", "howBtn": "Hướng dẫn", "guideTitle": "Cách lấy key", "g1": "Chọn thời lượng key (3–24 giờ) ở mục Get Key.", "g2": "Bấm Bắt đầu rồi hoàn thành lần lượt từng bước vượt link. Chờ đủ thời gian đếm ngược ở mỗi trang.", "g3": "Sau mỗi link rút gọn bạn sẽ quay lại trang nhiệm vụ — bấm Tiếp tục để sang bước kế.", "g4": "Xong tất cả các bước để hiện key, rồi bấm COPY KEY.", "g5": "Dán key vào ứng dụng. Mỗi key chỉ dùng cho 1 thiết bị.", "guideWarn": "Không dùng VPN, công cụ bypass hoặc đổi mạng giữa chừng, nếu không IP sẽ bị chặn.", "guideDontShow": "Không hiện lại trong 2 ngày", "guideClose": "Đóng", "guideOk": "Đã hiểu", "taskTitle": "ĐANG XỬ LÝ NHIỆM VỤ", "taskSub": "Hoàn thành lần lượt từng bước bên dưới", "home": "← Trang chủ", "duration": "Thời lượng", "device": "thiết bị", "step": "Bước", "continueStep": "TIẾP TỤC BƯỚC {n} →", "copyKey": "COPY KEY", "copied": "✓ ĐÃ COPY!", "expire": "Hết hạn", "completed": "Đã xong {a}/{b}", "netErr": "Lỗi mạng", "invalidTask": "Nhiệm vụ không hợp lệ", "noToken": "Thiếu token", "backHome": "← VỀ TRANG CHỦ", "maintTitle": "Đang bảo trì", "offTitle": "Website tạm ngưng", "devtools": "Trang này không cho phép công cụ nhà phát triển."},
+  "en": {"tagline": "Premium key gateway — fast, safe, transparent", "ticketMeta": "1 device · Valid 3 – 24 hours", "perk1": "1 device per key", "perk2": "Valid 3 – 24 hours", "perk3": "Key revealed after finishing tasks", "getKeyTitle": "Get Key", "getKeySub": "Pick a duration and finish the tasks to get your key", "loading": "Loading...", "steps": "steps", "maintenanceShort": "Maintenance", "noDurations": "No durations available right now", "starting": "Starting...", "opening": "Opening link...", "error": "Error", "ipLimitReached": "Your IP already reached the {limit}-key limit", "durationMaintenance": "This duration is under maintenance", "durationUnavailable": "This duration is not available right now", "siteUnavailable": "Site is under maintenance / offline", "ipLimitNote": "You have used {used}/{limit} key requests", "ipLimitAdmin": "Admin account — unlimited key requests", "howBtn": "How to use", "guideTitle": "How to get a key", "g1": "Pick a key duration (3–24 hours) in the Get Key section.", "g2": "Tap Start, then finish each link step in order. Wait the full countdown on every page.", "g3": "After each short link you return to the task page — tap Continue for the next step.", "g4": "Finish all steps to reveal your key, then tap COPY KEY.", "g5": "Paste the key into the app. One key works on 1 device only.", "guideWarn": "Do not use a VPN, bypass tools or switch network mid-task, or your IP will be blocked.", "guideDontShow": "Do not show again for 2 days", "guideClose": "Close", "guideOk": "Got it", "taskTitle": "PROCESSING TASK", "taskSub": "Complete each step below in order", "home": "← Home", "duration": "Duration", "device": "device", "step": "Step", "continueStep": "CONTINUE STEP {n} →", "copyKey": "COPY KEY", "copied": "✓ COPIED!", "expire": "Expires", "completed": "Completed {a}/{b}", "netErr": "Network error", "invalidTask": "Invalid task", "noToken": "Missing token", "backHome": "← BACK TO HOME", "maintTitle": "Under maintenance", "offTitle": "Website paused", "devtools": "Developer tools are not allowed on this page."},
+  "zh": {"tagline": "高级密钥门户——快速、安全、透明", "ticketMeta": "1 台设备 · 有效期 3 – 24 小时", "perk1": "每个密钥限 1 台设备", "perk2": "有效期 3 – 24 小时", "perk3": "完成任务后获取密钥", "getKeyTitle": "获取密钥", "getKeySub": "选择时长并完成任务以获取密钥", "loading": "加载中...", "steps": "步", "maintenanceShort": "维护中", "noDurations": "暂无可用时长", "starting": "正在开始...", "opening": "正在打开链接...", "error": "错误", "ipLimitReached": "您的 IP 已达到 {limit} 次取密钥上限", "durationMaintenance": "此时长正在维护", "durationUnavailable": "此时长暂不可用", "siteUnavailable": "网站维护中 / 已暂停", "ipLimitNote": "您已使用 {used}/{limit} 次取密钥机会", "ipLimitAdmin": "管理员账户——取密钥次数不限", "howBtn": "使用说明", "guideTitle": "如何获取密钥", "g1": "在“获取密钥”区域选择密钥时长（3–24 小时）。", "g2": "点击开始，然后按顺序完成每个链接步骤。每个页面都要等待完整倒计时。", "g3": "每个短链接结束后会返回任务页面——点击继续进入下一步。", "g4": "完成所有步骤后显示密钥，然后点击复制密钥。", "g5": "将密钥粘贴到应用中。每个密钥仅限 1 台设备使用。", "guideWarn": "请勿使用 VPN、绕过工具或在任务中途切换网络，否则 IP 将被封禁。", "guideDontShow": "2 天内不再显示", "guideClose": "关闭", "guideOk": "知道了", "taskTitle": "正在处理任务", "taskSub": "请按顺序完成下面的每一步", "home": "← 首页", "duration": "时长", "device": "台设备", "step": "步骤", "continueStep": "继续第 {n} 步 →", "copyKey": "复制密钥", "copied": "✓ 已复制！", "expire": "到期时间", "completed": "已完成 {a}/{b}", "netErr": "网络错误", "invalidTask": "无效任务", "noToken": "缺少令牌", "backHome": "← 返回首页", "maintTitle": "维护中", "offTitle": "网站已暂停", "devtools": "此页面不允许使用开发者工具。"},
+  "es": {"tagline": "Portal de claves premium: rápido, seguro y transparente", "ticketMeta": "1 dispositivo · Válido 3 – 24 horas", "perk1": "1 dispositivo por clave", "perk2": "Válido 3 – 24 horas", "perk3": "La clave se muestra al terminar las tareas", "getKeyTitle": "Obtener clave", "getKeySub": "Elige una duración y completa las tareas para obtener tu clave", "loading": "Cargando...", "steps": "pasos", "maintenanceShort": "Mantenimiento", "noDurations": "No hay duraciones disponibles ahora", "starting": "Iniciando...", "opening": "Abriendo enlace...", "error": "Error", "ipLimitReached": "Tu IP ya alcanzó el límite de {limit} claves", "durationMaintenance": "Esta duración está en mantenimiento", "durationUnavailable": "Esta duración no está disponible ahora", "siteUnavailable": "El sitio está en mantenimiento / fuera de línea", "ipLimitNote": "Has usado {used}/{limit} solicitudes de clave", "ipLimitAdmin": "Cuenta de administrador: solicitudes ilimitadas", "howBtn": "Cómo usar", "guideTitle": "Cómo obtener una clave", "g1": "Elige la duración de la clave (3–24 horas) en la sección Obtener clave.", "g2": "Pulsa Iniciar y completa cada paso de enlace en orden. Espera toda la cuenta atrás en cada página.", "g3": "Tras cada enlace corto volverás a la página de tareas: pulsa Continuar para el siguiente paso.", "g4": "Completa todos los pasos para ver tu clave y pulsa COPIAR CLAVE.", "g5": "Pega la clave en la aplicación. Cada clave funciona en 1 solo dispositivo.", "guideWarn": "No uses VPN ni herramientas de bypass ni cambies de red durante la tarea, o bloquearemos tu IP.", "guideDontShow": "No mostrar de nuevo durante 2 días", "guideClose": "Cerrar", "guideOk": "Entendido", "taskTitle": "PROCESANDO TAREA", "taskSub": "Completa cada paso de abajo en orden", "home": "← Inicio", "duration": "Duración", "device": "dispositivo", "step": "Paso", "continueStep": "CONTINUAR PASO {n} →", "copyKey": "COPIAR CLAVE", "copied": "✓ ¡COPIADO!", "expire": "Caduca", "completed": "Completado {a}/{b}", "netErr": "Error de red", "invalidTask": "Tarea no válida", "noToken": "Falta el token", "backHome": "← VOLVER AL INICIO", "maintTitle": "En mantenimiento", "offTitle": "Sitio web en pausa", "devtools": "Las herramientas de desarrollo no están permitidas en esta página."},
+  "hi": {"tagline": "प्रीमियम की गेटवे — तेज़, सुरक्षित, पारदर्शी", "ticketMeta": "1 डिवाइस · 3 – 24 घंटे मान्य", "perk1": "हर की पर 1 डिवाइस", "perk2": "3 – 24 घंटे मान्य", "perk3": "टास्क पूरे होने के बाद की मिलेगी", "getKeyTitle": "की प्राप्त करें", "getKeySub": "अवधि चुनें और की पाने के लिए टास्क पूरे करें", "loading": "लोड हो रहा है...", "steps": "चरण", "maintenanceShort": "मेंटेनेंस", "noDurations": "अभी कोई अवधि उपलब्ध नहीं है", "starting": "शुरू हो रहा है...", "opening": "लिंक खुल रहा है...", "error": "त्रुटि", "ipLimitReached": "आपका IP {limit} की की सीमा तक पहुँच चुका है", "durationMaintenance": "यह अवधि मेंटेनेंस में है", "durationUnavailable": "यह अवधि अभी उपलब्ध नहीं है", "siteUnavailable": "साइट मेंटेनेंस में है / बंद है", "ipLimitNote": "आपने {used}/{limit} की अनुरोध उपयोग किए हैं", "ipLimitAdmin": "एडमिन खाता — की अनुरोध असीमित", "howBtn": "उपयोग कैसे करें", "guideTitle": "की कैसे पाएँ", "g1": "की प्राप्त करें सेक्शन में की की अवधि (3–24 घंटे) चुनें।", "g2": "शुरू करें दबाएँ, फिर हर लिंक चरण क्रम से पूरा करें। हर पेज पर पूरा काउंटडाउन रुकें।", "g3": "हर शॉर्ट लिंक के बाद आप टास्क पेज पर लौटेंगे — अगले चरण के लिए जारी रखें दबाएँ।", "g4": "सभी चरण पूरे करने पर की दिखेगी, फिर की कॉपी करें दबाएँ।", "g5": "की को ऐप में पेस्ट करें। एक की केवल 1 डिवाइस पर चलती है।", "guideWarn": "VPN या बायपास टूल का उपयोग न करें और टास्क के बीच नेटवर्क न बदलें, वरना आपका IP ब्लॉक हो जाएगा।", "guideDontShow": "2 दिन तक दोबारा न दिखाएँ", "guideClose": "बंद करें", "guideOk": "समझ गया", "taskTitle": "टास्क प्रोसेस हो रहा है", "taskSub": "नीचे दिए हर चरण को क्रम से पूरा करें", "home": "← होम", "duration": "अवधि", "device": "डिवाइस", "step": "चरण", "continueStep": "चरण {n} जारी रखें →", "copyKey": "की कॉपी करें", "copied": "✓ कॉपी हो गया!", "expire": "समाप्ति", "completed": "{a}/{b} पूरे", "netErr": "नेटवर्क त्रुटि", "invalidTask": "अमान्य टास्क", "noToken": "टोकन नहीं मिला", "backHome": "← होम पर जाएँ", "maintTitle": "मेंटेनेंस जारी है", "offTitle": "वेबसाइट अस्थायी रूप से बंद", "devtools": "इस पेज पर डेवलपर टूल की अनुमति नहीं है।"},
+  "ar": {"tagline": "بوابة مفاتيح مميزة — سريعة وآمنة وشفافة", "ticketMeta": "جهاز واحد · صالح من 3 إلى 24 ساعة", "perk1": "جهاز واحد لكل مفتاح", "perk2": "صالح من 3 إلى 24 ساعة", "perk3": "يظهر المفتاح بعد إنهاء المهام", "getKeyTitle": "احصل على مفتاح", "getKeySub": "اختر المدة وأكمل المهام للحصول على مفتاحك", "loading": "جارٍ التحميل...", "steps": "خطوات", "maintenanceShort": "صيانة", "noDurations": "لا توجد مدد متاحة حاليًا", "starting": "جارٍ البدء...", "opening": "جارٍ فتح الرابط...", "error": "خطأ", "ipLimitReached": "وصل عنوان IP الخاص بك إلى حد {limit} مفاتيح", "durationMaintenance": "هذه المدة قيد الصيانة", "durationUnavailable": "هذه المدة غير متاحة حاليًا", "siteUnavailable": "الموقع قيد الصيانة / متوقف", "ipLimitNote": "استخدمت {used}/{limit} من طلبات المفاتيح", "ipLimitAdmin": "حساب المشرف — طلبات مفاتيح غير محدودة", "howBtn": "طريقة الاستخدام", "guideTitle": "كيف تحصل على مفتاح", "g1": "اختر مدة المفتاح (3–24 ساعة) من قسم الحصول على مفتاح.", "g2": "اضغط ابدأ ثم أكمل كل خطوة رابط بالترتيب. انتظر العد التنازلي كاملًا في كل صفحة.", "g3": "بعد كل رابط مختصر ستعود إلى صفحة المهام — اضغط متابعة للخطوة التالية.", "g4": "أكمل جميع الخطوات ليظهر المفتاح ثم اضغط نسخ المفتاح.", "g5": "الصق المفتاح في التطبيق. كل مفتاح يعمل على جهاز واحد فقط.", "guideWarn": "لا تستخدم VPN أو أدوات التجاوز ولا تغيّر الشبكة أثناء المهمة وإلا سيتم حظر عنوان IP الخاص بك.", "guideDontShow": "عدم الإظهار مجددًا لمدة يومين", "guideClose": "إغلاق", "guideOk": "فهمت", "taskTitle": "جارٍ معالجة المهمة", "taskSub": "أكمل كل خطوة أدناه بالترتيب", "home": "→ الرئيسية", "duration": "المدة", "device": "جهاز", "step": "الخطوة", "continueStep": "متابعة الخطوة {n} ←", "copyKey": "نسخ المفتاح", "copied": "✓ تم النسخ!", "expire": "ينتهي في", "completed": "اكتمل {a}/{b}", "netErr": "خطأ في الشبكة", "invalidTask": "مهمة غير صالحة", "noToken": "الرمز مفقود", "backHome": "→ العودة إلى الرئيسية", "maintTitle": "قيد الصيانة", "offTitle": "الموقع متوقف مؤقتًا", "devtools": "أدوات المطور غير مسموح بها في هذه الصفحة."},
+  "pt": {"tagline": "Portal de chaves premium — rápido, seguro e transparente", "ticketMeta": "1 dispositivo · Válida por 3 – 24 horas", "perk1": "1 dispositivo por chave", "perk2": "Válida por 3 – 24 horas", "perk3": "A chave aparece após concluir as tarefas", "getKeyTitle": "Obter chave", "getKeySub": "Escolha a duração e conclua as tarefas para obter sua chave", "loading": "Carregando...", "steps": "etapas", "maintenanceShort": "Manutenção", "noDurations": "Nenhuma duração disponível no momento", "starting": "Iniciando...", "opening": "Abrindo link...", "error": "Erro", "ipLimitReached": "Seu IP já atingiu o limite de {limit} chaves", "durationMaintenance": "Esta duração está em manutenção", "durationUnavailable": "Esta duração não está disponível agora", "siteUnavailable": "Site em manutenção / fora do ar", "ipLimitNote": "Você usou {used}/{limit} solicitações de chave", "ipLimitAdmin": "Conta de administrador — solicitações ilimitadas", "howBtn": "Como usar", "guideTitle": "Como obter uma chave", "g1": "Escolha a duração da chave (3–24 horas) na seção Obter chave.", "g2": "Toque em Iniciar e conclua cada etapa de link em ordem. Aguarde toda a contagem regressiva em cada página.", "g3": "Após cada link curto você volta à página de tarefas — toque em Continuar para a próxima etapa.", "g4": "Conclua todas as etapas para revelar a chave e toque em COPIAR CHAVE.", "g5": "Cole a chave no aplicativo. Cada chave funciona em apenas 1 dispositivo.", "guideWarn": "Não use VPN, ferramentas de bypass nem troque de rede durante a tarefa, ou seu IP será bloqueado.", "guideDontShow": "Não mostrar novamente por 2 dias", "guideClose": "Fechar", "guideOk": "Entendi", "taskTitle": "PROCESSANDO TAREFA", "taskSub": "Conclua cada etapa abaixo em ordem", "home": "← Início", "duration": "Duração", "device": "dispositivo", "step": "Etapa", "continueStep": "CONTINUAR ETAPA {n} →", "copyKey": "COPIAR CHAVE", "copied": "✓ COPIADO!", "expire": "Expira em", "completed": "Concluído {a}/{b}", "netErr": "Erro de rede", "invalidTask": "Tarefa inválida", "noToken": "Token ausente", "backHome": "← VOLTAR AO INÍCIO", "maintTitle": "Em manutenção", "offTitle": "Site pausado", "devtools": "Ferramentas de desenvolvedor não são permitidas nesta página."},
+  "ru": {"tagline": "Премиум-портал ключей — быстро, безопасно, прозрачно", "ticketMeta": "1 устройство · Действует 3 – 24 часа", "perk1": "1 устройство на ключ", "perk2": "Действует 3 – 24 часа", "perk3": "Ключ показывается после выполнения заданий", "getKeyTitle": "Получить ключ", "getKeySub": "Выберите срок и выполните задания, чтобы получить ключ", "loading": "Загрузка...", "steps": "шагов", "maintenanceShort": "Тех. работы", "noDurations": "Сейчас нет доступных сроков", "starting": "Запуск...", "opening": "Открываем ссылку...", "error": "Ошибка", "ipLimitReached": "Ваш IP достиг лимита в {limit} ключей", "durationMaintenance": "Этот срок на техническом обслуживании", "durationUnavailable": "Этот срок сейчас недоступен", "siteUnavailable": "Сайт на техобслуживании / отключён", "ipLimitNote": "Вы использовали {used}/{limit} запросов ключа", "ipLimitAdmin": "Аккаунт администратора — запросы без ограничений", "howBtn": "Как пользоваться", "guideTitle": "Как получить ключ", "g1": "Выберите срок действия ключа (3–24 часа) в разделе «Получить ключ».", "g2": "Нажмите «Старт» и по порядку пройдите каждый шаг со ссылкой. На каждой странице дождитесь конца обратного отсчёта.", "g3": "После каждой короткой ссылки вы вернётесь на страницу заданий — нажмите «Продолжить» для следующего шага.", "g4": "Пройдите все шаги, чтобы появился ключ, и нажмите «Копировать ключ».", "g5": "Вставьте ключ в приложение. Один ключ работает только на 1 устройстве.", "guideWarn": "Не используйте VPN, средства обхода и не меняйте сеть во время задания, иначе ваш IP будет заблокирован.", "guideDontShow": "Не показывать 2 дня", "guideClose": "Закрыть", "guideOk": "Понятно", "taskTitle": "ОБРАБОТКА ЗАДАНИЯ", "taskSub": "Выполняйте шаги ниже по порядку", "home": "← Главная", "duration": "Срок", "device": "устройство", "step": "Шаг", "continueStep": "ПРОДОЛЖИТЬ ШАГ {n} →", "copyKey": "КОПИРОВАТЬ КЛЮЧ", "copied": "✓ СКОПИРОВАНО!", "expire": "Истекает", "completed": "Выполнено {a}/{b}", "netErr": "Ошибка сети", "invalidTask": "Неверное задание", "noToken": "Нет токена", "backHome": "← НА ГЛАВНУЮ", "maintTitle": "Технические работы", "offTitle": "Сайт временно отключён", "devtools": "Инструменты разработчика на этой странице запрещены."},
+  "id": {"tagline": "Gerbang kunci premium — cepat, aman, transparan", "ticketMeta": "1 perangkat · Berlaku 3 – 24 jam", "perk1": "1 perangkat per kunci", "perk2": "Berlaku 3 – 24 jam", "perk3": "Kunci muncul setelah tugas selesai", "getKeyTitle": "Dapatkan Kunci", "getKeySub": "Pilih durasi dan selesaikan tugas untuk mendapatkan kunci", "loading": "Memuat...", "steps": "langkah", "maintenanceShort": "Pemeliharaan", "noDurations": "Belum ada durasi yang tersedia", "starting": "Memulai...", "opening": "Membuka tautan...", "error": "Kesalahan", "ipLimitReached": "IP Anda sudah mencapai batas {limit} kunci", "durationMaintenance": "Durasi ini sedang dalam pemeliharaan", "durationUnavailable": "Durasi ini sedang tidak tersedia", "siteUnavailable": "Situs sedang dalam pemeliharaan / offline", "ipLimitNote": "Anda telah memakai {used}/{limit} permintaan kunci", "ipLimitAdmin": "Akun admin — permintaan kunci tanpa batas", "howBtn": "Cara pakai", "guideTitle": "Cara mendapatkan kunci", "g1": "Pilih durasi kunci (3–24 jam) di bagian Dapatkan Kunci.", "g2": "Ketuk Mulai lalu selesaikan setiap langkah tautan secara berurutan. Tunggu hitung mundur penuh di tiap halaman.", "g3": "Setelah tiap tautan pendek, Anda kembali ke halaman tugas — ketuk Lanjutkan untuk langkah berikutnya.", "g4": "Selesaikan semua langkah agar kunci muncul, lalu ketuk SALIN KUNCI.", "g5": "Tempel kunci di aplikasi. Satu kunci hanya untuk 1 perangkat.", "guideWarn": "Jangan pakai VPN, alat bypass, atau ganti jaringan di tengah tugas, atau IP Anda akan diblokir.", "guideDontShow": "Jangan tampilkan lagi selama 2 hari", "guideClose": "Tutup", "guideOk": "Mengerti", "taskTitle": "MEMPROSES TUGAS", "taskSub": "Selesaikan setiap langkah di bawah secara berurutan", "home": "← Beranda", "duration": "Durasi", "device": "perangkat", "step": "Langkah", "continueStep": "LANJUTKAN LANGKAH {n} →", "copyKey": "SALIN KUNCI", "copied": "✓ TERSALIN!", "expire": "Berakhir", "completed": "Selesai {a}/{b}", "netErr": "Kesalahan jaringan", "invalidTask": "Tugas tidak valid", "noToken": "Token tidak ada", "backHome": "← KEMBALI KE BERANDA", "maintTitle": "Sedang pemeliharaan", "offTitle": "Situs dijeda", "devtools": "Alat pengembang tidak diizinkan di halaman ini."},
+  "ja": {"tagline": "プレミアムキーゲートウェイ — 高速・安全・透明", "ticketMeta": "1台のデバイス · 有効期間 3〜24時間", "perk1": "キー1つにつき1台のデバイス", "perk2": "有効期間 3〜24時間", "perk3": "タスク完了後にキーを表示", "getKeyTitle": "キーを取得", "getKeySub": "期間を選んでタスクを完了するとキーを取得できます", "loading": "読み込み中...", "steps": "ステップ", "maintenanceShort": "メンテナンス", "noDurations": "現在利用できる期間はありません", "starting": "開始中...", "opening": "リンクを開いています...", "error": "エラー", "ipLimitReached": "お使いのIPはキー{limit}回の上限に達しました", "durationMaintenance": "この期間はメンテナンス中です", "durationUnavailable": "この期間は現在利用できません", "siteUnavailable": "サイトはメンテナンス中 / 停止中です", "ipLimitNote": "キー取得 {used}/{limit} 回を使用しました", "ipLimitAdmin": "管理者アカウント — キー取得は無制限", "howBtn": "使い方", "guideTitle": "キーの取得方法", "g1": "「キーを取得」で有効期間（3〜24時間）を選びます。", "g2": "開始をタップし、各リンクのステップを順番に完了します。各ページでカウントダウンが終わるまで待ってください。", "g3": "短縮リンクのあとタスクページに戻ります。「続行」をタップして次のステップへ進みます。", "g4": "すべてのステップを完了するとキーが表示されます。「キーをコピー」をタップしてください。", "g5": "キーをアプリに貼り付けます。1つのキーは1台のデバイスでのみ使えます。", "guideWarn": "VPN・バイパスツールの使用や、タスク中のネットワーク切り替えはしないでください。IPがブロックされます。", "guideDontShow": "2日間表示しない", "guideClose": "閉じる", "guideOk": "了解", "taskTitle": "タスク処理中", "taskSub": "下のステップを順番に完了してください", "home": "← ホーム", "duration": "期間", "device": "台", "step": "ステップ", "continueStep": "ステップ{n}を続行 →", "copyKey": "キーをコピー", "copied": "✓ コピーしました！", "expire": "有効期限", "completed": "{a}/{b} 完了", "netErr": "ネットワークエラー", "invalidTask": "無効なタスクです", "noToken": "トークンがありません", "backHome": "← ホームに戻る", "maintTitle": "メンテナンス中", "offTitle": "サイト一時停止中", "devtools": "このページでは開発者ツールは使用できません。"},
+  "fr": {"tagline": "Portail de clés premium — rapide, sûr, transparent", "ticketMeta": "1 appareil · Valable 3 – 24 heures", "perk1": "1 appareil par clé", "perk2": "Valable 3 – 24 heures", "perk3": "La clé s’affiche après les tâches", "getKeyTitle": "Obtenir une clé", "getKeySub": "Choisissez une durée et terminez les tâches pour obtenir votre clé", "loading": "Chargement...", "steps": "étapes", "maintenanceShort": "Maintenance", "noDurations": "Aucune durée disponible pour le moment", "starting": "Démarrage...", "opening": "Ouverture du lien...", "error": "Erreur", "ipLimitReached": "Votre IP a atteint la limite de {limit} clés", "durationMaintenance": "Cette durée est en maintenance", "durationUnavailable": "Cette durée n’est pas disponible actuellement", "siteUnavailable": "Site en maintenance / hors ligne", "ipLimitNote": "Vous avez utilisé {used}/{limit} demandes de clé", "ipLimitAdmin": "Compte admin — demandes de clé illimitées", "howBtn": "Mode d’emploi", "guideTitle": "Comment obtenir une clé", "g1": "Choisissez la durée de la clé (3–24 heures) dans la section Obtenir une clé.", "g2": "Appuyez sur Démarrer puis terminez chaque étape de lien dans l’ordre. Attendez tout le compte à rebours sur chaque page.", "g3": "Après chaque lien court, vous revenez à la page des tâches — appuyez sur Continuer pour l’étape suivante.", "g4": "Terminez toutes les étapes pour afficher la clé, puis appuyez sur COPIER LA CLÉ.", "g5": "Collez la clé dans l’application. Une clé ne fonctionne que sur 1 appareil.", "guideWarn": "N’utilisez pas de VPN ni d’outil de contournement et ne changez pas de réseau pendant la tâche, sinon votre IP sera bloquée.", "guideDontShow": "Ne plus afficher pendant 2 jours", "guideClose": "Fermer", "guideOk": "Compris", "taskTitle": "TRAITEMENT DE LA TÂCHE", "taskSub": "Terminez chaque étape ci-dessous dans l’ordre", "home": "← Accueil", "duration": "Durée", "device": "appareil", "step": "Étape", "continueStep": "CONTINUER L’ÉTAPE {n} →", "copyKey": "COPIER LA CLÉ", "copied": "✓ COPIÉ !", "expire": "Expire le", "completed": "Terminé {a}/{b}", "netErr": "Erreur réseau", "invalidTask": "Tâche invalide", "noToken": "Jeton manquant", "backHome": "← RETOUR À L’ACCUEIL", "maintTitle": "En maintenance", "offTitle": "Site suspendu", "devtools": "Les outils de développement sont interdits sur cette page."},
+  "ko": {"tagline": "프리미엄 키 게이트웨이 — 빠르고 안전하며 투명하게", "ticketMeta": "기기 1대 · 유효 3 – 24시간", "perk1": "키당 기기 1대", "perk2": "유효 3 – 24시간", "perk3": "작업 완료 후 키 표시", "getKeyTitle": "키 받기", "getKeySub": "기간을 선택하고 작업을 완료하여 키를 받으세요", "loading": "불러오는 중...", "steps": "단계", "maintenanceShort": "점검 중", "noDurations": "현재 사용 가능한 기간이 없습니다", "starting": "시작 중...", "opening": "링크 여는 중...", "error": "오류", "ipLimitReached": "내 IP가 키 {limit}회 제한에 도달했습니다", "durationMaintenance": "이 기간은 점검 중입니다", "durationUnavailable": "이 기간은 현재 사용할 수 없습니다", "siteUnavailable": "사이트 점검 중 / 일시 중단", "ipLimitNote": "키 요청 {used}/{limit}회 사용했습니다", "ipLimitAdmin": "관리자 계정 — 키 요청 무제한", "howBtn": "사용 방법", "guideTitle": "키 받는 방법", "g1": "키 받기 섹션에서 키 기간(3–24시간)을 선택하세요.", "g2": "시작을 누르고 각 링크 단계를 순서대로 완료하세요. 각 페이지에서 카운트다운이 끝날 때까지 기다리세요.", "g3": "단축 링크 후 작업 페이지로 돌아옵니다. 계속을 눌러 다음 단계로 가세요.", "g4": "모든 단계를 마치면 키가 표시됩니다. 키 복사를 누르세요.", "g5": "키를 앱에 붙여넣으세요. 키 하나는 기기 1대에서만 작동합니다.", "guideWarn": "VPN, 우회 도구를 사용하거나 작업 중 네트워크를 바꾸지 마세요. IP가 차단됩니다.", "guideDontShow": "2일 동안 다시 표시하지 않기", "guideClose": "닫기", "guideOk": "확인", "taskTitle": "작업 처리 중", "taskSub": "아래 단계를 순서대로 완료하세요", "home": "← 홈", "duration": "기간", "device": "대", "step": "단계", "continueStep": "{n}단계 계속 →", "copyKey": "키 복사", "copied": "✓ 복사됨!", "expire": "만료", "completed": "{a}/{b} 완료", "netErr": "네트워크 오류", "invalidTask": "잘못된 작업", "noToken": "토큰 없음", "backHome": "← 홈으로", "maintTitle": "점검 중", "offTitle": "사이트 일시 중단", "devtools": "이 페이지에서는 개발자 도구를 사용할 수 없습니다."},
+  "th": {"tagline": "ประตูรับคีย์พรีเมียม — เร็ว ปลอดภัย โปร่งใส", "ticketMeta": "1 อุปกรณ์ · ใช้ได้ 3 – 24 ชั่วโมง", "perk1": "1 อุปกรณ์ต่อ 1 คีย์", "perk2": "ใช้ได้ 3 – 24 ชั่วโมง", "perk3": "รับคีย์หลังทำภารกิจเสร็จ", "getKeyTitle": "รับคีย์", "getKeySub": "เลือกระยะเวลาและทำภารกิจให้เสร็จเพื่อรับคีย์", "loading": "กำลังโหลด...", "steps": "ขั้นตอน", "maintenanceShort": "ปิดปรับปรุง", "noDurations": "ขณะนี้ยังไม่มีระยะเวลาที่ใช้งานได้", "starting": "กำลังเริ่ม...", "opening": "กำลังเปิดลิงก์...", "error": "ข้อผิดพลาด", "ipLimitReached": "IP ของคุณถึงขีดจำกัด {limit} คีย์แล้ว", "durationMaintenance": "ระยะเวลานี้อยู่ระหว่างปรับปรุง", "durationUnavailable": "ระยะเวลานี้ยังไม่พร้อมใช้งาน", "siteUnavailable": "เว็บไซต์อยู่ระหว่างปรับปรุง / ปิดให้บริการ", "ipLimitNote": "คุณใช้สิทธิ์รับคีย์ไปแล้ว {used}/{limit} ครั้ง", "ipLimitAdmin": "บัญชีผู้ดูแล — รับคีย์ได้ไม่จำกัด", "howBtn": "วิธีใช้", "guideTitle": "วิธีรับคีย์", "g1": "เลือกระยะเวลาของคีย์ (3–24 ชั่วโมง) ในส่วนรับคีย์", "g2": "กดเริ่ม แล้วทำแต่ละขั้นตอนของลิงก์ตามลำดับ รอนับถอยหลังให้ครบในทุกหน้า", "g3": "หลังลิงก์สั้นแต่ละอัน คุณจะกลับมาที่หน้าภารกิจ — กดดำเนินการต่อเพื่อไปขั้นตอนถัดไป", "g4": "ทำทุกขั้นตอนให้เสร็จเพื่อแสดงคีย์ แล้วกดคัดลอกคีย์", "g5": "วางคีย์ในแอป หนึ่งคีย์ใช้ได้กับ 1 อุปกรณ์เท่านั้น", "guideWarn": "ห้ามใช้ VPN เครื่องมือบายพาส หรือเปลี่ยนเครือข่ายระหว่างทำภารกิจ มิฉะนั้น IP ของคุณจะถูกบล็อก", "guideDontShow": "ไม่แสดงอีกเป็นเวลา 2 วัน", "guideClose": "ปิด", "guideOk": "เข้าใจแล้ว", "taskTitle": "กำลังประมวลผลภารกิจ", "taskSub": "ทำแต่ละขั้นตอนด้านล่างตามลำดับ", "home": "← หน้าแรก", "duration": "ระยะเวลา", "device": "อุปกรณ์", "step": "ขั้นตอน", "continueStep": "ทำขั้นตอนที่ {n} ต่อ →", "copyKey": "คัดลอกคีย์", "copied": "✓ คัดลอกแล้ว!", "expire": "หมดอายุ", "completed": "เสร็จแล้ว {a}/{b}", "netErr": "เครือข่ายขัดข้อง", "invalidTask": "ภารกิจไม่ถูกต้อง", "noToken": "ไม่พบโทเคน", "backHome": "← กลับหน้าแรก", "maintTitle": "กำลังปิดปรับปรุง", "offTitle": "เว็บไซต์ปิดชั่วคราว", "devtools": "หน้านี้ไม่อนุญาตให้ใช้เครื่องมือนักพัฒนา"},
+  "de": {"tagline": "Premium-Key-Portal — schnell, sicher, transparent", "ticketMeta": "1 Gerät · 3 – 24 Stunden gültig", "perk1": "1 Gerät pro Key", "perk2": "3 – 24 Stunden gültig", "perk3": "Key wird nach den Aufgaben angezeigt", "getKeyTitle": "Key holen", "getKeySub": "Wähle eine Dauer und schließe die Aufgaben ab, um deinen Key zu erhalten", "loading": "Lädt...", "steps": "Schritte", "maintenanceShort": "Wartung", "noDurations": "Derzeit keine Laufzeiten verfügbar", "starting": "Startet...", "opening": "Link wird geöffnet...", "error": "Fehler", "ipLimitReached": "Deine IP hat das Limit von {limit} Keys erreicht", "durationMaintenance": "Diese Laufzeit ist in Wartung", "durationUnavailable": "Diese Laufzeit ist derzeit nicht verfügbar", "siteUnavailable": "Website in Wartung / offline", "ipLimitNote": "Du hast {used}/{limit} Key-Anfragen genutzt", "ipLimitAdmin": "Admin-Konto — unbegrenzte Key-Anfragen", "howBtn": "Anleitung", "guideTitle": "So erhältst du einen Key", "g1": "Wähle die Key-Dauer (3–24 Stunden) im Bereich Key holen.", "g2": "Tippe auf Start und schließe jeden Link-Schritt der Reihe nach ab. Warte auf jeder Seite den ganzen Countdown ab.", "g3": "Nach jedem Kurzlink kehrst du zur Aufgabenseite zurück — tippe auf Weiter für den nächsten Schritt.", "g4": "Schließe alle Schritte ab, damit der Key erscheint, und tippe auf KEY KOPIEREN.", "g5": "Füge den Key in die App ein. Ein Key funktioniert nur auf 1 Gerät.", "guideWarn": "Nutze kein VPN, keine Bypass-Tools und wechsle während der Aufgabe nicht das Netzwerk, sonst wird deine IP gesperrt.", "guideDontShow": "2 Tage lang nicht mehr anzeigen", "guideClose": "Schließen", "guideOk": "Verstanden", "taskTitle": "AUFGABE WIRD VERARBEITET", "taskSub": "Schließe jeden Schritt unten der Reihe nach ab", "home": "← Startseite", "duration": "Dauer", "device": "Gerät", "step": "Schritt", "continueStep": "SCHRITT {n} FORTSETZEN →", "copyKey": "KEY KOPIEREN", "copied": "✓ KOPIERT!", "expire": "Läuft ab", "completed": "{a}/{b} abgeschlossen", "netErr": "Netzwerkfehler", "invalidTask": "Ungültige Aufgabe", "noToken": "Token fehlt", "backHome": "← ZUR STARTSEITE", "maintTitle": "Wartungsarbeiten", "offTitle": "Website pausiert", "devtools": "Entwicklertools sind auf dieser Seite nicht erlaubt."}
+};
+const I18N_TASK = {
+  "vi": {"maintenanceShort": "Bảo trì", "loading": "Đang tải...", "taskTitle": "ĐANG XỬ LÝ NHIỆM VỤ", "taskSub": "Hoàn thành lần lượt từng bước bên dưới", "home": "← Trang chủ", "duration": "Thời lượng", "device": "thiết bị", "step": "Bước", "continueStep": "TIẾP TỤC BƯỚC {n} →", "copyKey": "COPY KEY", "copied": "✓ ĐÃ COPY!", "expire": "Hết hạn", "completed": "Đã xong {a}/{b}", "netErr": "Lỗi mạng", "invalidTask": "Nhiệm vụ không hợp lệ", "noToken": "Thiếu token", "backHome": "← VỀ TRANG CHỦ", "devtools": "Trang này không cho phép công cụ nhà phát triển.", "error": "Lỗi"},
+  "en": {"maintenanceShort": "Maintenance", "loading": "Loading...", "taskTitle": "PROCESSING TASK", "taskSub": "Complete each step below in order", "home": "← Home", "duration": "Duration", "device": "device", "step": "Step", "continueStep": "CONTINUE STEP {n} →", "copyKey": "COPY KEY", "copied": "✓ COPIED!", "expire": "Expires", "completed": "Completed {a}/{b}", "netErr": "Network error", "invalidTask": "Invalid task", "noToken": "Missing token", "backHome": "← BACK TO HOME", "devtools": "Developer tools are not allowed on this page.", "error": "Error"},
+  "zh": {"maintenanceShort": "维护中", "loading": "加载中...", "taskTitle": "正在处理任务", "taskSub": "请按顺序完成下面的每一步", "home": "← 首页", "duration": "时长", "device": "台设备", "step": "步骤", "continueStep": "继续第 {n} 步 →", "copyKey": "复制密钥", "copied": "✓ 已复制！", "expire": "到期时间", "completed": "已完成 {a}/{b}", "netErr": "网络错误", "invalidTask": "无效任务", "noToken": "缺少令牌", "backHome": "← 返回首页", "devtools": "此页面不允许使用开发者工具。", "error": "错误"},
+  "es": {"maintenanceShort": "Mantenimiento", "loading": "Cargando...", "taskTitle": "PROCESANDO TAREA", "taskSub": "Completa cada paso de abajo en orden", "home": "← Inicio", "duration": "Duración", "device": "dispositivo", "step": "Paso", "continueStep": "CONTINUAR PASO {n} →", "copyKey": "COPIAR CLAVE", "copied": "✓ ¡COPIADO!", "expire": "Caduca", "completed": "Completado {a}/{b}", "netErr": "Error de red", "invalidTask": "Tarea no válida", "noToken": "Falta el token", "backHome": "← VOLVER AL INICIO", "devtools": "Las herramientas de desarrollo no están permitidas en esta página.", "error": "Error"},
+  "hi": {"maintenanceShort": "मेंटेनेंस", "loading": "लोड हो रहा है...", "taskTitle": "टास्क प्रोसेस हो रहा है", "taskSub": "नीचे दिए हर चरण को क्रम से पूरा करें", "home": "← होम", "duration": "अवधि", "device": "डिवाइस", "step": "चरण", "continueStep": "चरण {n} जारी रखें →", "copyKey": "की कॉपी करें", "copied": "✓ कॉपी हो गया!", "expire": "समाप्ति", "completed": "{a}/{b} पूरे", "netErr": "नेटवर्क त्रुटि", "invalidTask": "अमान्य टास्क", "noToken": "टोकन नहीं मिला", "backHome": "← होम पर जाएँ", "devtools": "इस पेज पर डेवलपर टूल की अनुमति नहीं है।", "error": "त्रुटि"},
+  "ar": {"maintenanceShort": "صيانة", "loading": "جارٍ التحميل...", "taskTitle": "جارٍ معالجة المهمة", "taskSub": "أكمل كل خطوة أدناه بالترتيب", "home": "→ الرئيسية", "duration": "المدة", "device": "جهاز", "step": "الخطوة", "continueStep": "متابعة الخطوة {n} ←", "copyKey": "نسخ المفتاح", "copied": "✓ تم النسخ!", "expire": "ينتهي في", "completed": "اكتمل {a}/{b}", "netErr": "خطأ في الشبكة", "invalidTask": "مهمة غير صالحة", "noToken": "الرمز مفقود", "backHome": "→ العودة إلى الرئيسية", "devtools": "أدوات المطور غير مسموح بها في هذه الصفحة.", "error": "خطأ"},
+  "pt": {"maintenanceShort": "Manutenção", "loading": "Carregando...", "taskTitle": "PROCESSANDO TAREFA", "taskSub": "Conclua cada etapa abaixo em ordem", "home": "← Início", "duration": "Duração", "device": "dispositivo", "step": "Etapa", "continueStep": "CONTINUAR ETAPA {n} →", "copyKey": "COPIAR CHAVE", "copied": "✓ COPIADO!", "expire": "Expira em", "completed": "Concluído {a}/{b}", "netErr": "Erro de rede", "invalidTask": "Tarefa inválida", "noToken": "Token ausente", "backHome": "← VOLTAR AO INÍCIO", "devtools": "Ferramentas de desenvolvedor não são permitidas nesta página.", "error": "Erro"},
+  "ru": {"maintenanceShort": "Тех. работы", "loading": "Загрузка...", "taskTitle": "ОБРАБОТКА ЗАДАНИЯ", "taskSub": "Выполняйте шаги ниже по порядку", "home": "← Главная", "duration": "Срок", "device": "устройство", "step": "Шаг", "continueStep": "ПРОДОЛЖИТЬ ШАГ {n} →", "copyKey": "КОПИРОВАТЬ КЛЮЧ", "copied": "✓ СКОПИРОВАНО!", "expire": "Истекает", "completed": "Выполнено {a}/{b}", "netErr": "Ошибка сети", "invalidTask": "Неверное задание", "noToken": "Нет токена", "backHome": "← НА ГЛАВНУЮ", "devtools": "Инструменты разработчика на этой странице запрещены.", "error": "Ошибка"},
+  "id": {"maintenanceShort": "Pemeliharaan", "loading": "Memuat...", "taskTitle": "MEMPROSES TUGAS", "taskSub": "Selesaikan setiap langkah di bawah secara berurutan", "home": "← Beranda", "duration": "Durasi", "device": "perangkat", "step": "Langkah", "continueStep": "LANJUTKAN LANGKAH {n} →", "copyKey": "SALIN KUNCI", "copied": "✓ TERSALIN!", "expire": "Berakhir", "completed": "Selesai {a}/{b}", "netErr": "Kesalahan jaringan", "invalidTask": "Tugas tidak valid", "noToken": "Token tidak ada", "backHome": "← KEMBALI KE BERANDA", "devtools": "Alat pengembang tidak diizinkan di halaman ini.", "error": "Kesalahan"},
+  "ja": {"maintenanceShort": "メンテナンス", "loading": "読み込み中...", "taskTitle": "タスク処理中", "taskSub": "下のステップを順番に完了してください", "home": "← ホーム", "duration": "期間", "device": "台", "step": "ステップ", "continueStep": "ステップ{n}を続行 →", "copyKey": "キーをコピー", "copied": "✓ コピーしました！", "expire": "有効期限", "completed": "{a}/{b} 完了", "netErr": "ネットワークエラー", "invalidTask": "無効なタスクです", "noToken": "トークンがありません", "backHome": "← ホームに戻る", "devtools": "このページでは開発者ツールは使用できません。", "error": "エラー"},
+  "fr": {"maintenanceShort": "Maintenance", "loading": "Chargement...", "taskTitle": "TRAITEMENT DE LA TÂCHE", "taskSub": "Terminez chaque étape ci-dessous dans l’ordre", "home": "← Accueil", "duration": "Durée", "device": "appareil", "step": "Étape", "continueStep": "CONTINUER L’ÉTAPE {n} →", "copyKey": "COPIER LA CLÉ", "copied": "✓ COPIÉ !", "expire": "Expire le", "completed": "Terminé {a}/{b}", "netErr": "Erreur réseau", "invalidTask": "Tâche invalide", "noToken": "Jeton manquant", "backHome": "← RETOUR À L’ACCUEIL", "devtools": "Les outils de développement sont interdits sur cette page.", "error": "Erreur"},
+  "ko": {"maintenanceShort": "점검 중", "loading": "불러오는 중...", "taskTitle": "작업 처리 중", "taskSub": "아래 단계를 순서대로 완료하세요", "home": "← 홈", "duration": "기간", "device": "대", "step": "단계", "continueStep": "{n}단계 계속 →", "copyKey": "키 복사", "copied": "✓ 복사됨!", "expire": "만료", "completed": "{a}/{b} 완료", "netErr": "네트워크 오류", "invalidTask": "잘못된 작업", "noToken": "토큰 없음", "backHome": "← 홈으로", "devtools": "이 페이지에서는 개발자 도구를 사용할 수 없습니다.", "error": "오류"},
+  "th": {"maintenanceShort": "ปิดปรับปรุง", "loading": "กำลังโหลด...", "taskTitle": "กำลังประมวลผลภารกิจ", "taskSub": "ทำแต่ละขั้นตอนด้านล่างตามลำดับ", "home": "← หน้าแรก", "duration": "ระยะเวลา", "device": "อุปกรณ์", "step": "ขั้นตอน", "continueStep": "ทำขั้นตอนที่ {n} ต่อ →", "copyKey": "คัดลอกคีย์", "copied": "✓ คัดลอกแล้ว!", "expire": "หมดอายุ", "completed": "เสร็จแล้ว {a}/{b}", "netErr": "เครือข่ายขัดข้อง", "invalidTask": "ภารกิจไม่ถูกต้อง", "noToken": "ไม่พบโทเคน", "backHome": "← กลับหน้าแรก", "devtools": "หน้านี้ไม่อนุญาตให้ใช้เครื่องมือนักพัฒนา", "error": "ข้อผิดพลาด"},
+  "de": {"maintenanceShort": "Wartung", "loading": "Lädt...", "taskTitle": "AUFGABE WIRD VERARBEITET", "taskSub": "Schließe jeden Schritt unten der Reihe nach ab", "home": "← Startseite", "duration": "Dauer", "device": "Gerät", "step": "Schritt", "continueStep": "SCHRITT {n} FORTSETZEN →", "copyKey": "KEY KOPIEREN", "copied": "✓ KOPIERT!", "expire": "Läuft ab", "completed": "{a}/{b} abgeschlossen", "netErr": "Netzwerkfehler", "invalidTask": "Ungültige Aufgabe", "noToken": "Token fehlt", "backHome": "← ZUR STARTSEITE", "devtools": "Entwicklertools sind auf dieser Seite nicht erlaubt.", "error": "Fehler"}
+};
+const I18N_MAINT = {
+  "vi": {"maintTitle": "Đang bảo trì", "offTitle": "Website tạm ngưng", "maintenanceShort": "Bảo trì"},
+  "en": {"maintTitle": "Under maintenance", "offTitle": "Website paused", "maintenanceShort": "Maintenance"},
+  "zh": {"maintTitle": "维护中", "offTitle": "网站已暂停", "maintenanceShort": "维护中"},
+  "es": {"maintTitle": "En mantenimiento", "offTitle": "Sitio web en pausa", "maintenanceShort": "Mantenimiento"},
+  "hi": {"maintTitle": "मेंटेनेंस जारी है", "offTitle": "वेबसाइट अस्थायी रूप से बंद", "maintenanceShort": "मेंटेनेंस"},
+  "ar": {"maintTitle": "قيد الصيانة", "offTitle": "الموقع متوقف مؤقتًا", "maintenanceShort": "صيانة"},
+  "pt": {"maintTitle": "Em manutenção", "offTitle": "Site pausado", "maintenanceShort": "Manutenção"},
+  "ru": {"maintTitle": "Технические работы", "offTitle": "Сайт временно отключён", "maintenanceShort": "Тех. работы"},
+  "id": {"maintTitle": "Sedang pemeliharaan", "offTitle": "Situs dijeda", "maintenanceShort": "Pemeliharaan"},
+  "ja": {"maintTitle": "メンテナンス中", "offTitle": "サイト一時停止中", "maintenanceShort": "メンテナンス"},
+  "fr": {"maintTitle": "En maintenance", "offTitle": "Site suspendu", "maintenanceShort": "Maintenance"},
+  "ko": {"maintTitle": "점검 중", "offTitle": "사이트 일시 중단", "maintenanceShort": "점검 중"},
+  "th": {"maintTitle": "กำลังปิดปรับปรุง", "offTitle": "เว็บไซต์ปิดชั่วคราว", "maintenanceShort": "ปิดปรับปรุง"},
+  "de": {"maintTitle": "Wartungsarbeiten", "offTitle": "Website pausiert", "maintenanceShort": "Wartung"}
+};
+
+// Nhận diện ngôn ngữ: lưu trước đó -> ngôn ngữ trình duyệt -> English
+const NS_DETECT_JS = `function nsDetectLang(){try{var s=localStorage.getItem('ns_lang');if(s&&I18N[s])return s}catch(e){}var l=navigator.languages||[navigator.language||'vi'];for(var i=0;i<l.length;i++){var p=String(l[i]).toLowerCase().slice(0,2);if(I18N[p])return p}return 'en'}`;
+
+// Popup hướng dẫn: có ô tích "không hiện lại 2 ngày" + nút đóng
+const GUIDE_CSS = `<style>
+.g-ov{position:fixed;inset:0;z-index:9998;background:rgba(3,6,18,.72);-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;padding:16px}
+.g-box{position:relative;width:min(100%,440px);max-height:88vh;overflow:auto;background:#0f1530;border:1px solid rgba(255,255,255,.14);border-radius:18px;padding:22px 20px 18px;color:#e5e7eb;box-shadow:0 20px 60px rgba(0,0,0,.55)}
+.g-box h3{margin:0 36px 12px 0;font-size:18px}
+.g-x{position:absolute;top:10px;right:10px;width:34px;height:34px;border-radius:50%;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;font-size:16px;cursor:pointer}
+.g-list{margin:0 0 12px;padding-left:20px;font-size:14px;line-height:1.55}
+.g-list li{margin:6px 0}
+.g-warn{font-size:13px;line-height:1.5;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35);color:#fecaca;border-radius:10px;padding:9px 11px;margin-bottom:12px}
+.g-chk{display:flex;align-items:center;gap:9px;font-size:13.5px;margin:4px 0 14px;cursor:pointer}
+.g-chk input{width:18px;height:18px;accent-color:#8b5cf6;flex:none}
+.g-act{display:flex;gap:10px}
+.g-btn{flex:1;padding:11px;border:0;border-radius:11px;font-weight:700;font-size:14px;cursor:pointer;color:#fff;background:linear-gradient(135deg,#22d3ee,#8b5cf6)}
+.g-btn.ghost{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.16)}
+[dir=rtl] .g-x{right:auto;left:10px}
+[dir=rtl] .g-box h3{margin:0 0 12px 36px}
+[dir=rtl] .g-list{padding-left:0;padding-right:20px}
+#langSel option{color:#111;background:#fff}
+html:not(.adm) body{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+html:not(.adm) input,html:not(.adm) textarea,html:not(.adm) #keyBox{-webkit-user-select:text;user-select:text}
+img{-webkit-user-drag:none}
+</style>`;
+
+const GUIDE_HTML = GUIDE_CSS + `
+<div id="guideOv" class="g-ov" role="dialog" aria-modal="true" onclick="if(event.target===this)closeGuide()">
+<div class="g-box">
+<button class="g-x" type="button" onclick="closeGuide()" aria-label="Close">&#10005;</button>
+<h3 data-i18n="guideTitle">Cách lấy key</h3>
+<ol class="g-list">
+<li data-i18n="g1"></li><li data-i18n="g2"></li><li data-i18n="g3"></li><li data-i18n="g4"></li><li data-i18n="g5"></li>
+</ol>
+<div class="g-warn" data-i18n="guideWarn"></div>
+<label class="g-chk"><input type="checkbox" id="guideChk"><span data-i18n="guideDontShow">Không hiện lại trong 2 ngày</span></label>
+<div class="g-act">
+<button class="g-btn ghost" type="button" onclick="closeGuide()" data-i18n="guideClose">Đóng</button>
+<button class="g-btn" type="button" onclick="closeGuide()" data-i18n="guideOk">Đã hiểu</button>
+</div>
+</div>
+</div>`;
+
+const GUIDE_JS = `
+function nsHideGuide(){var o=document.getElementById('guideOv');if(o)o.style.display='none'}
+function openGuide(){var o=document.getElementById('guideOv');if(!o)return;var c=document.getElementById('guideChk');if(c)c.checked=false;o.style.display='flex'}
+function closeGuide(){var c=document.getElementById('guideChk');if(c&&c.checked){try{localStorage.setItem('ns_guide_until',String(Date.now()+48*3600*1000))}catch(e){}}nsHideGuide()}
+document.addEventListener('keydown',function(e){if(e.key==='Escape')closeGuide()});
+(function(){var u=0;try{u=Number(localStorage.getItem('ns_guide_until')||0)}catch(e){}if(Date.now()>=u){setTimeout(function(){var o=document.getElementById('guideOv');if(o&&!window.__NS_ADMIN)o.style.display='flex'},350)}})();
+`;
+
+// Chống xem log / DevTools (chỉ là lớp cản trở phía trình duyệt; chặn thật nằm ở server)
+const PROTECT_JS = `
+window.__NS_ADMIN=false;
+function nsSetAdmin(v){window.__NS_ADMIN=!!v;try{document.documentElement.classList.toggle('adm',!!v)}catch(e){}}
+(function(){
+var touch=('ontouchstart' in window)||(navigator.maxTouchPoints>0);
+function adm(){return window.__NS_ADMIN===true}
+try{if(window.top!==window.self){window.top.location=window.self.location}}catch(e){}
+document.addEventListener('contextmenu',function(e){if(!adm())e.preventDefault()});
+document.addEventListener('dragstart',function(e){if(!adm())e.preventDefault()});
+document.addEventListener('keydown',function(e){
+ if(adm())return;
+ var k=String(e.key||'').toLowerCase(),c=e.ctrlKey||e.metaKey;
+ var bad=(e.key==='F12')||(c&&e.shiftKey&&(k==='i'||k==='j'||k==='c'||k==='k'))||(c&&(k==='u'||k==='s'))||(e.metaKey&&e.altKey&&(k==='i'||k==='j'||k==='u'||k==='c'));
+ if(bad){e.preventDefault();e.stopPropagation()}
+},true);
+try{if(!adm()){var nop=function(){};['log','info','warn','error','debug','table','dir','trace'].forEach(function(m){try{console[m]=nop}catch(x){}})}}catch(e){}
+var ov=null;
+function lockScreen(on){
+ if(on&&!ov){ov=document.createElement('div');ov.style.cssText='position:fixed;inset:0;z-index:2147483647;background:#050816;color:#e5e7eb;display:flex;align-items:center;justify-content:center;text-align:center;padding:24px;font:600 16px system-ui,sans-serif';ov.textContent=(typeof t==='function'?t('devtools'):'Developer tools are not allowed.');document.body.appendChild(ov)}
+ else if(!on&&ov){ov.parentNode&&ov.parentNode.removeChild(ov);ov=null}
+}
+if(!touch){setInterval(function(){
+ if(adm()){lockScreen(false);return}
+ var open=(window.outerWidth-window.innerWidth>160)||(window.outerHeight-window.innerHeight>160);
+ lockScreen(open)
+},800)}
+})();
+`;
+
 const MAIN_HTML = `<!DOCTYPE html>
 <html lang="vi"><head>
 <meta charset="utf-8">
@@ -2464,6 +2725,8 @@ ${THEME_HEAD}
 </head><body>
 ${THEME_BG}
 <div id="msg" role="status" aria-live="polite"></div>
+${GUIDE_HTML}
+<script>${PROTECT_JS}${GUIDE_JS}</script>
 
 <header class="topbar">
 <a class="brand" href="/">
@@ -2474,7 +2737,8 @@ ${THEME_BG}
 <span style="display:flex;gap:8px;align-items:center">
 <span id="statusDot" class="status-dot online"><i></i>ONLINE</span>
 <span id="redisBadge"></span>
-<button id="langBtn" class="pill" onclick="toggleLang()" style="cursor:pointer">EN</button>
+<button class="pill" type="button" onclick="openGuide()" aria-label="Guide" title="Guide" style="cursor:pointer;font-weight:800">?</button>
+<select id="langSel" class="pill" onchange="setLang(this.value)" aria-label="Language" style="cursor:pointer;background:transparent;color:inherit;max-width:104px"></select>
 </span>
 </header>
 
@@ -2717,69 +2981,36 @@ ${THEME_BG}
 </main>
 
 <script>
-// ---------- I18N (VI / EN) ----------
-const I18N = {
-  vi: {
-    tagline: 'Cổng lấy key cao cấp — nhanh, an toàn, minh bạch',
-    ticketMeta: '1 thiết bị · Hiệu lực 3 – 24 giờ',
-    perk1: '1 thiết bị cho mỗi key',
-    perk2: 'Hiệu lực 3 – 24 giờ',
-    perk3: 'Nhận key sau khi xong nhiệm vụ',
-    getKeyTitle: 'Get Key',
-    getKeySub: 'Chọn thời lượng và hoàn thành nhiệm vụ để nhận key',
-    loading: 'Đang tải...',
-    steps: 'bước',
-    maintenanceShort: 'Bảo trì',
-    noDurations: 'Hiện chưa có mốc thời gian nào khả dụng',
-    starting: 'Đang bắt đầu...',
-    opening: 'Đang mở liên kết...',
-    error: 'Lỗi',
-    ipLimitReached: 'IP của bạn đã đạt giới hạn {limit} lần lấy key',
-    durationMaintenance: 'Mốc thời gian này đang bảo trì',
-    durationUnavailable: 'Mốc thời gian này hiện không khả dụng',
-    siteUnavailable: 'Website đang bảo trì / tạm ngưng',
-    ipLimitNote: 'Bạn đã dùng {used}/{limit} lượt lấy key',
-    ipLimitAdmin: 'Tài khoản admin — không giới hạn lượt lấy key'
-  },
-  en: {
-    tagline: 'Premium key gateway — fast, safe, transparent',
-    ticketMeta: '1 device · Valid 3 – 24 hours',
-    perk1: '1 device per key',
-    perk2: 'Valid 3 – 24 hours',
-    perk3: 'Key revealed after finishing tasks',
-    getKeyTitle: 'Get Key',
-    getKeySub: 'Pick a duration and finish the tasks to get your key',
-    loading: 'Loading...',
-    steps: 'steps',
-    maintenanceShort: 'Maintenance',
-    noDurations: 'No durations available right now',
-    starting: 'Starting...',
-    opening: 'Opening link...',
-    error: 'Error',
-    ipLimitReached: 'Your IP already reached the {limit}-key limit',
-    durationMaintenance: 'This duration is under maintenance',
-    durationUnavailable: 'This duration is not available right now',
-    siteUnavailable: 'Site is under maintenance / offline',
-    ipLimitNote: 'You have used {used}/{limit} key requests',
-    ipLimitAdmin: 'Admin account — unlimited key requests'
-  }
-};
-let currentLang = localStorage.getItem('ns_lang') || 'vi';
+// ---------- I18N (14 ngôn ngữ) ----------
+const I18N = ${JSON.stringify(I18N_ALL)};
+const LANG_LIST = ${JSON.stringify(LANG_LIST)};
+const RTL_LANGS = ['ar'];
+${NS_DETECT_JS}
+let currentLang = nsDetectLang();
 function t(key) { return (I18N[currentLang] && I18N[currentLang][key]) || (I18N.vi[key] || key); }
 function applyLang() {
+  document.documentElement.lang = currentLang;
+  document.documentElement.dir = RTL_LANGS.indexOf(currentLang) > -1 ? 'rtl' : 'ltr';
   document.querySelectorAll('[data-i18n]').forEach(el => {
-    const key = el.getAttribute('data-i18n');
-    if (I18N[currentLang] && I18N[currentLang][key]) el.textContent = I18N[currentLang][key];
+    const v = t(el.getAttribute('data-i18n'));
+    if (v) el.textContent = v;
   });
-  const btn = document.getElementById('langBtn');
-  if (btn) btn.textContent = currentLang === 'vi' ? 'EN' : 'VI';
+  const sel = document.getElementById('langSel');
+  if (sel) sel.value = currentLang;
   renderAppDurations();
 }
-function toggleLang() {
-  currentLang = currentLang === 'vi' ? 'en' : 'vi';
-  localStorage.setItem('ns_lang', currentLang);
+function setLang(l) {
+  if (!I18N[l]) return;
+  currentLang = l;
+  try { localStorage.setItem('ns_lang', l); } catch (e) {}
   applyLang();
 }
+(function () {
+  const sel = document.getElementById('langSel');
+  if (!sel) return;
+  LANG_LIST.forEach(p => { const o = document.createElement('option'); o.value = p[0]; o.textContent = p[1]; sel.appendChild(o); });
+  sel.value = currentLang;
+})();
 
 let keysData = [];
 let lastResult = null;
@@ -2814,7 +3045,7 @@ async function refreshStatusDot() {
       dot.innerHTML = '<i></i>ONLINE';
     } else {
       dot.className = 'status-dot maintenance';
-      dot.innerHTML = '<i></i>' + (j.status === 'off' ? 'OFF' : 'BẢO TRÌ');
+      dot.innerHTML = '<i></i>' + (j.status === 'off' ? 'OFF' : t('maintenanceShort').toUpperCase());
     }
   } catch (e) {}
 }
@@ -2826,7 +3057,9 @@ let clientIsAdmin = false;
   const r = await fetch('/api/verify-admin', {method:'POST'});
   const j = await r.json();
   clientIsAdmin = !!j.isAdmin;
+  nsSetAdmin(!!j.isAdmin);
   if (j.isAdmin) {
+    nsHideGuide();
     document.getElementById('adminPanel').style.display = 'block';
     await loadSiteConfigForAdmin();
     await syncWhitelist();
@@ -3639,18 +3872,26 @@ ${THEME_BG}
 <span class="brand-mark">${THEME_LOGO}</span>
 <span class="brand-name">ThichLenDo</span>
 </a>
-<span id="statusDot" class="status-dot ${isOff ? 'maintenance' : 'maintenance'}"><i></i>${isOff ? 'OFF' : 'BẢO TRÌ'}</span>
+<span id="statusDot" class="status-dot ${isOff ? 'maintenance' : 'maintenance'}"><i></i><span id="dotTxt" data-off="${isOff ? 1 : 0}">${isOff ? 'OFF' : 'BẢO TRÌ'}</span></span>
 </header>
 <main class="maint-wrap">
 <div class="card maint-card">
 <div class="maint-icon ${isOff ? 'off' : 'maintenance'}">
 <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94z"/></svg>
 </div>
-<h1>${title}</h1>
+<h1 data-i18n="${isOff ? 'offTitle' : 'maintTitle'}">${title}</h1>
 <p>${message.replace(/</g,'&lt;')}</p>
 </div>
 <div class="hint foot-credit" style="margin-top:22px">✦ Crafted by <b>ThichLenDo</b> ✦</div>
 </main>
+<script>
+const I18N = ${JSON.stringify(I18N_MAINT)};
+${NS_DETECT_JS}
+(function(){var L=nsDetectLang();var d=I18N[L]||I18N.vi;var h=document.querySelector('[data-i18n]');
+if(h&&d[h.getAttribute('data-i18n')])h.textContent=d[h.getAttribute('data-i18n')];
+var dt=document.getElementById('dotTxt');if(dt&&dt.getAttribute('data-off')!=='1')dt.textContent=d.maintenanceShort.toUpperCase();
+document.documentElement.lang=L;document.documentElement.dir=(L==='ar'?'rtl':'ltr')})();
+</script>
 </body></html>`;
 }
 
@@ -3662,6 +3903,7 @@ function renderTaskPage(token) {
 <title>NetSuper · Task</title>
 ${THEME_HEAD}
 <style>${THEME_CSS}${TASK_CSS}</style>
+${GUIDE_CSS}
 </head><body>
 ${THEME_BG}
 
@@ -3672,7 +3914,8 @@ ${THEME_BG}
 </a>
 <span style="display:flex;gap:8px;align-items:center">
 <span id="statusDot" class="status-dot online"><i></i>ONLINE</span>
-<a class="pill" href="/">← Trang chủ</a>
+<select id="langSel" class="pill" onchange="setLang(this.value)" aria-label="Language" style="cursor:pointer;background:transparent;color:inherit;max-width:104px"></select>
+<a class="pill" href="/" data-i18n="home">← Trang chủ</a>
 </span>
 </header>
 
@@ -3683,11 +3926,11 @@ ${THEME_BG}
 <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6h11M9 12h11M9 18h11"/><path d="m3.5 6 1.2 1.2L7 4.8M3.5 12l1.2 1.2L7 10.8M3.5 18l1.2 1.2L7 16.8"/></svg>
 </span>
 <div>
-<h1>PROCESSING TASK</h1>
-<p class="card-sub">Hoàn thành lần lượt từng bước bên dưới</p>
+<h1 data-i18n="taskTitle">PROCESSING TASK</h1>
+<p class="card-sub" data-i18n="taskSub">Hoàn thành lần lượt từng bước bên dưới</p>
 </div>
 </div>
-<div class="sub" id="sub">Loading...</div>
+<div class="sub" id="sub" data-i18n="loading">Loading...</div>
 <div class="progress" id="progress"></div>
 <div id="actions"></div>
 <div class="status" id="status"></div>
@@ -3696,26 +3939,52 @@ ${THEME_BG}
 </main>
 <script>
 const token = ${JSON.stringify(token)};
+const I18N = ${JSON.stringify(I18N_TASK)};
+const LANG_LIST = ${JSON.stringify(LANG_LIST)};
+const RTL_LANGS = ['ar'];
+${NS_DETECT_JS}
+let currentLang = nsDetectLang();
+function t(k) { return (I18N[currentLang] && I18N[currentLang][k]) || (I18N.vi[k] || k); }
+function applyLang() {
+  document.documentElement.lang = currentLang;
+  document.documentElement.dir = RTL_LANGS.indexOf(currentLang) > -1 ? 'rtl' : 'ltr';
+  document.querySelectorAll('[data-i18n]').forEach(el => { const v = t(el.getAttribute('data-i18n')); if (v) el.textContent = v; });
+  const sel = document.getElementById('langSel'); if (sel) sel.value = currentLang;
+}
+function setLang(l) {
+  if (!I18N[l]) return;
+  currentLang = l;
+  try { localStorage.setItem('ns_lang', l); } catch (e) {}
+  applyLang();
+  if (token) refresh();
+}
+(function () {
+  const sel = document.getElementById('langSel');
+  if (!sel) return;
+  LANG_LIST.forEach(p => { const o = document.createElement('option'); o.value = p[0]; o.textContent = p[1]; sel.appendChild(o); });
+  sel.value = currentLang;
+})();
+applyLang();
 let polling = null;
 async function refresh() {
-  if (!token) return showError('No token');
+  if (!token) return showError(t('noToken'));
   const r = await fetch('/api/task-status?token=' + token);
   const j = await r.json();
-  if (!j.ok) return showError('Invalid task');
+  if (!j.ok) return showError(t('invalidTask'));
   if (j.bypassed) {
     document.getElementById('sub').innerHTML = '';
     document.getElementById('progress').innerHTML = '';
     const acts = document.getElementById('actions');
     acts.innerHTML = '<div class="bypass-box"><h3>⛔ BYPASS DETECTED</h3><p>' + j.bypassReason + '</p></div>';
     const homeBtn = document.createElement('button');
-    homeBtn.className = 'homebtn'; homeBtn.textContent = '← VỀ TRANG CHỦ';
+    homeBtn.className = 'homebtn'; homeBtn.textContent = t('backHome');
     homeBtn.onclick = () => location.href = '/';
     acts.appendChild(homeBtn);
     if (polling) clearInterval(polling);
     return;
   }
-  const devTag = j.maxDevices > 0 ? ' · ' + j.maxDevices + ' device' : '';
-  document.getElementById('sub').innerHTML = 'Duration: <span class="duration-badge">' + j.duration.toUpperCase() + '</span>' + devTag + (j.isAdmin ? ' [ADMIN]' : '');
+  const devTag = j.maxDevices > 0 ? ' · ' + j.maxDevices + ' ' + t('device') : '';
+  document.getElementById('sub').innerHTML = t('duration') + ': <span class="duration-badge">' + j.duration.toUpperCase() + '</span>' + devTag + (j.isAdmin ? ' [ADMIN]' : '');
   const prog = document.getElementById('progress');
   prog.innerHTML = '';
   j.steps.forEach((type, i) => {
@@ -3725,7 +3994,7 @@ async function refresh() {
     else if (i === j.currentStep) { cls='current'; icon='▶'; }
     row.className = 'step-row ' + cls;
     const label = type === 'link4m' ? 'Link4M (80s)' : (type === 'link999' ? 'Link999 (90s)' : 'TrafficVN (90s)');
-    row.innerHTML = '<span class="step-icon">' + icon + '</span> Step ' + (i+1) + '/' + j.total + ' — ' + label;
+    row.innerHTML = '<span class="step-icon">' + icon + '</span> ' + t('step') + ' ' + (i+1) + '/' + j.total + ' — ' + label;
     prog.appendChild(row);
   });
   const acts = document.getElementById('actions');
@@ -3734,31 +4003,31 @@ async function refresh() {
     const kb = document.createElement('div'); kb.id = 'keyBox'; kb.textContent = j.key;
     acts.appendChild(kb);
     const btn = document.createElement('button');
-    btn.className = 'copybtn'; btn.textContent = 'COPY KEY';
-    btn.onclick = () => { navigator.clipboard.writeText(j.key); btn.textContent='✓ COPIED!'; setTimeout(()=>btn.textContent='COPY KEY',2000); };
+    btn.className = 'copybtn'; btn.textContent = t('copyKey');
+    btn.onclick = () => { navigator.clipboard.writeText(j.key); btn.textContent=t('copied'); setTimeout(()=>btn.textContent=t('copyKey'),2000); };
     acts.appendChild(btn);
-    document.getElementById('status').textContent = 'Expire: ' + j.keyExpire;
+    document.getElementById('status').textContent = t('expire') + ': ' + j.keyExpire;
     if (polling) clearInterval(polling);
     return;
   }
   const btn = document.createElement('button');
-  btn.textContent = 'CONTINUE STEP ' + (j.currentStep + 1) + ' →';
+  btn.textContent = t('continueStep').replace('{n}', j.currentStep + 1);
   btn.onclick = () => continueTask(btn);
   acts.appendChild(btn);
-  document.getElementById('status').textContent = 'Completed ' + j.completedSteps + '/' + j.total;
+  document.getElementById('status').textContent = t('completed').replace('{a}', j.completedSteps).replace('{b}', j.total);
 }
 async function continueTask(btn) {
-  btn.disabled = true; btn.textContent = 'Loading...';
+  btn.disabled = true; btn.textContent = t('loading');
   try {
     const r = await fetch('/api/continue-task?token=' + token);
     const j = await r.json();
     if (j.done) return refresh();
-    if (!j.ok) { btn.textContent='Error'; btn.disabled=false; setTimeout(refresh,2000); return; }
+    if (!j.ok) { btn.textContent=t('error'); btn.disabled=false; setTimeout(refresh,2000); return; }
     location.href = j.url;
-  } catch (e) { btn.textContent = 'Network error'; btn.disabled = false; }
+  } catch (e) { btn.textContent = t('netErr'); btn.disabled = false; }
 }
-function showError(t) {
-  document.getElementById('sub').innerHTML = '<span style="color:#ef4444">' + t + '</span>';
+function showError(m) {
+  document.getElementById('sub').innerHTML = '<span style="color:#ef4444">' + m + '</span>';
   document.getElementById('progress').innerHTML = '';
   document.getElementById('actions').innerHTML = '';
   document.getElementById('status').textContent = '';
@@ -3770,7 +4039,7 @@ async function refreshStatusDot() {
     const dot = document.getElementById('statusDot');
     if (!dot) return;
     if (j.status === 'online') { dot.className = 'status-dot online'; dot.innerHTML = '<i></i>ONLINE'; }
-    else { dot.className = 'status-dot maintenance'; dot.innerHTML = '<i></i>' + (j.status === 'off' ? 'OFF' : 'BẢO TRÌ'); }
+    else { dot.className = 'status-dot maintenance'; dot.innerHTML = '<i></i>' + (j.status === 'off' ? 'OFF' : t('maintenanceShort').toUpperCase()); }
   } catch (e) {}
 }
 refreshStatusDot();
@@ -3778,6 +4047,7 @@ setInterval(refreshStatusDot, 15000);
 refresh();
 polling = setInterval(refresh, 3000);
 </script>
+<script>${PROTECT_JS}</script>
 ${THEME_JS}
 </body></html>`;
 }
@@ -4072,4 +4342,17 @@ load(true);
 </body></html>
 `;
 
-app.listen(PORT, () => console.log('✅ NetSuper running on port ' + PORT));
+// Bắt lỗi chung (body quá lớn, JSON hỏng...) — không lộ stack
+app.use((err, req, res, next) => {
+    const code = (err && err.status) || 400;
+    if (res.headersSent) return next(err);
+    res.status(code).json({ ok: false });
+});
+
+const server = app.listen(PORT, () => console.log('✅ NetSuper running on port ' + PORT));
+// Chống Slowloris / giữ kết nối treo
+server.headersTimeout = 15000;
+server.requestTimeout = 30000;
+server.keepAliveTimeout = 5000;
+server.timeout = 40000;
+server.maxHeadersCount = 60;
