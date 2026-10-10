@@ -162,7 +162,11 @@ const TRAFFICVN_API_URL = 'https://trafficvn.com/apidevelop';
 const LINK999_API_KEY_B64 = 'ZDRmMGMyNzliZjVkMDFjOGM2M2QxMjdhOTQ5ZmVhNzcyODhiMzg2OA==';
 const LINK999_API_KEY = process.env.LINK999_API_KEY || Buffer.from(LINK999_API_KEY_B64, 'base64').toString('utf8');
 const LINK999_API_URL = 'https://link999.app/st';
-const LINK999_TYPE = String(process.env.LINK999_TYPE || '5');   // 5 = Google Search 4 Step
+const LINK999_TYPE = '5';   // CỐ ĐỊNH: luôn dùng mốc 5 = Google Search 4 Step (không cho dùng mốc khác)
+// VietUser (token che bằng base64, có thể ghi đè bằng env VIETUSER_API_KEY)
+const VIETUSER_API_KEY_B64 = 'NTQ1MjdhODkwZDMzZmQzYWMxYWZkZWU2MzQzMGI3NmM1OTU0ZTI2YzM5YWMzMDAwMjVmNTE3OTc5NzU5NzA2MA==';
+const VIETUSER_API_KEY = process.env.VIETUSER_API_KEY || Buffer.from(VIETUSER_API_KEY_B64, 'base64').toString('utf8');
+const VIETUSER_API_URL = 'https://vietuser.com/st';
 
 // ⭐ User get key = LUÔN 1 DEVICE cho mọi mức
 const DURATION_CONFIG = {
@@ -184,7 +188,18 @@ const VIP_PACKAGES = {
 const MIN_LINK4M_MS = 80 * 1000;
 const MIN_TRAFFICVN_MS = 90 * 1000;
 const MIN_LINK999_MS = (Number(process.env.LINK999_MIN_SECONDS) || 90) * 1000;
-const VALID_REFERERS = ['link4m.co','www.link4m.co','link4m.com','www.link4m.com','trafficvn.com','www.trafficvn.com','link999.app','www.link999.app'];
+const MIN_VIETUSER_MS = (Number(process.env.VIETUSER_MIN_SECONDS) || 90) * 1000;
+const VALID_REFERERS = ['link4m.co','www.link4m.co','link4m.com','www.link4m.com','trafficvn.com','www.trafficvn.com','link999.app','www.link999.app','vietuser.com','www.vietuser.com']
+    .concat(String(process.env.EXTRA_REFERERS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean));
+
+// ⭐ Danh sách link vượt hỗ trợ (thứ tự do admin tự sắp theo từng mốc giờ)
+const SHORTENERS = {
+    link4m:    { label: 'Link4M',                        minMs: MIN_LINK4M_MS },
+    trafficvn: { label: 'TrafficVN',                     minMs: MIN_TRAFFICVN_MS },
+    link999:   { label: 'Link999 (Google Search 4 Step)', minMs: MIN_LINK999_MS },
+    vietuser:  { label: 'VietUser',                      minMs: MIN_VIETUSER_MS }
+};
+const SHORTENER_IDS = Object.keys(SHORTENERS);
 const BAD_UA_PATTERNS = ['curl','wget','python','okhttp','postman','insomnia','axios','node-fetch','go-http-client','java/','libwww','httpie','powershell','headlesschrome','phantomjs','selenium','puppeteer','playwright'];
 const RATE_LIMIT_WINDOW = 60 * 60 * 1000;
 const RATE_LIMIT_MAX = 5;
@@ -394,7 +409,10 @@ async function loadAppsConfig() {
                     if (parsed[appId].devices !== undefined) merged[appId].devices = normDevices(parsed[appId].devices);
                     for (const dur of Object.keys(merged[appId].durations)) {
                         if (parsed[appId].durations && parsed[appId].durations[dur]) {
+                            const fallbackSteps = merged[appId].durations[dur].steps;
                             merged[appId].durations[dur] = { ...merged[appId].durations[dur], ...parsed[appId].durations[dur] };
+                            const okSteps = (merged[appId].durations[dur].steps || []).filter(x => SHORTENER_IDS.includes(x));
+                            merged[appId].durations[dur].steps = okSteps.length ? okSteps : fallbackSteps;
                         }
                     }
                 }
@@ -409,7 +427,8 @@ async function saveAppsConfig() {
 function sanitizeSteps(steps, duration) {
     const max = DURATION_MAX_STEPS[duration] || 5;
     if (!Array.isArray(steps)) return null;
-    const clean = steps.filter(s => s === 'link4m' || s === 'trafficvn' || s === 'link999');
+    const clean = steps.filter(s => s !== '' && s !== null && s !== undefined);
+    if (clean.some(s => !SHORTENER_IDS.includes(s))) return null;
     if (clean.length < 1 || clean.length > max) return null;
     return clean;
 }
@@ -573,7 +592,7 @@ function detectBypass(req, task, stepType) {
     const currentUA = req.headers['user-agent'] || '';
     const currentReferer = req.headers['referer'] || req.headers['referrer'] || '';
     const elapsed = Date.now() - task.stepStartedAt;
-    let minTime = stepType === 'link4m' ? MIN_LINK4M_MS : (stepType === 'link999' ? MIN_LINK999_MS : MIN_TRAFFICVN_MS);
+    let minTime = (SHORTENERS[stepType] || SHORTENERS.trafficvn).minMs;
     if (elapsed < minTime) reasons.push(`Thời gian quá ngắn (${Math.round(elapsed/1000)}s < ${Math.round(minTime/1000)}s)`);
     if (currentIP !== task.stepIP) reasons.push('IP thay đổi');
     const uaLower = currentUA.toLowerCase();
@@ -599,36 +618,55 @@ function stepsForHours(h) {
     if (h >= 6)  return ['link4m','trafficvn'];
     return ['link4m'];
 }
+// Link kiểu /st?api=TOKEN&url=DEST: server tự gọi và đọc link rút gọn (không lộ token cho người dùng)
+async function genStLink(baseUrl, token, cb, extra) {
+    const params = new URLSearchParams(Object.assign({ api: token, url: cb }, extra || {}));
+    const r = await fetch(`${baseUrl}?${params}`, {
+        redirect: 'manual',
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NetSuperKeyServer/1.0)', 'Accept': 'text/html,application/json,*/*' }
+    });
+    const loc = r.headers.get('location');
+    if (loc && /^https?:\/\//i.test(loc)) return loc;
+    const body = await r.text().catch(() => '');
+    if (/^\s*[{\[]/.test(body)) {
+        try {
+            const j = JSON.parse(body);
+            const u = j.shortenedUrl || j.short_url || j.shortlink || j.url || null;
+            if (u && /^https?:\/\//i.test(u)) return u;
+        } catch (e) {}
+    }
+    const m = body.match(/http-equiv=["']?refresh["']?[^>]*url=([^"'>\s]+)/i) || body.match(/window\.location(?:\.href)?\s*=\s*["']([^"']+)["']/i);
+    if (m && /^https?:\/\//i.test(m[1])) return m[1];
+    const txt = body.trim();
+    if (/^https?:\/\/\S+$/i.test(txt)) return txt;
+    console.error('genStLink: không lấy được link rút gọn, status', r.status, baseUrl);
+    return null;
+}
 async function genShortLink(type, cb) {
     try {
+        let url = null;
         if (type === 'link4m') {
             const params = new URLSearchParams({ api: LINK4M_API_KEY, url: cb, format: 'json' });
             const r = await fetch(`${LINK4M_API_URL}?${params}`);
             const j = await r.json();
-            if (j.status === 'success' && j.shortenedUrl) return j.shortenedUrl;
+            if (j.status === 'success' && j.shortenedUrl) url = j.shortenedUrl;
         } else if (type === 'link999') {
-            // Link999: /st?api=TOKEN&url=DEST&type=N  -> server redirect sang link rút gọn.
-            // Gọi từ server và đọc header Location để KHÔNG lộ token cho người dùng.
-            const params = new URLSearchParams({ api: LINK999_API_KEY, url: cb, type: LINK999_TYPE });
-            const r = await fetch(`${LINK999_API_URL}?${params}`, {
-                redirect: 'manual',
-                headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NetSuperKeyServer/1.0)' }
-            });
-            const loc = r.headers.get('location');
-            if (loc && /^https?:\/\//i.test(loc)) return loc;
-            const ct = String(r.headers.get('content-type') || '');
-            if (ct.includes('json')) {
-                const j = await r.json();
-                const u = j.shortenedUrl || j.short_url || j.url || null;
-                if (u && /^https?:\/\//i.test(u)) return u;
-            }
-            console.error('genShortLink link999: không lấy được link, status', r.status);
+            // Link999: LUÔN dùng type=5 (Google Search 4 Step)
+            url = await genStLink(LINK999_API_URL, LINK999_API_KEY, cb, { type: LINK999_TYPE });
+        } else if (type === 'vietuser') {
+            url = await genStLink(VIETUSER_API_URL, VIETUSER_API_KEY, cb);
         } else {
             const params = new URLSearchParams({ api: TRAFFICVN_API_KEY, url: cb, fallback_url: cb });
             const r = await fetch(`${TRAFFICVN_API_URL}?${params}`);
             const j = await r.json();
-            return j.shortenedUrl || j.short_url || j.url || null;
+            url = j.shortenedUrl || j.short_url || j.url || null;
         }
+        if (!url) return null;
+        // An toàn: nếu dịch vụ trả thẳng về trang của mình (lỗi token / không rút gọn) thì KHÔNG đưa cho người dùng, tránh bị lọt bước
+        try {
+            if (new URL(url).hostname === new URL(SERVER_URL).hostname) { console.error('genShortLink: link trả về trùng domain server, bỏ qua', type); return null; }
+        } catch (e) { return null; }
+        return url;
     } catch (e) { console.error('genShortLink err:', e.message); }
     return null;
 }
@@ -903,7 +941,8 @@ app.get('/api/apps-config', (req, res) => {
             };
         }
     }
-    res.json({ ok: true, apps: out, isAdmin: admin });
+    res.json({ ok: true, apps: out, isAdmin: admin,
+        shorteners: SHORTENER_IDS.map(id => ({ id, label: SHORTENERS[id].label, seconds: Math.round(SHORTENERS[id].minMs / 1000) })) });
 });
 
 // ---- Apps config (admin write) ----
@@ -936,6 +975,35 @@ app.post('/api/apps-prefix', async (req, res) => {
     if (tailStyle === 'alnum12' || tailStyle === 'special9') appsConfigCache[appId].tailStyle = tailStyle;
     await saveAppsConfig();
     return res.json({ ok: true, app: appId, prefix: clean, tailStyle: appsConfigCache[appId].tailStyle });
+});
+
+// ---- Admin: chọn mốc giờ + thứ tự link rồi tạo nhiệm vụ ngay; save=true thì lưu thứ tự đó cho TOÀN SERVER ----
+app.post('/api/admin-create-task', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
+    const { app: appRaw, duration, steps, save } = req.body || {};
+    const appId = appRaw === 'netsupervip' ? 'netsupervip' : 'netsuper';
+    const appCfg = appsConfigCache[appId];
+    const durCfg = appCfg && appCfg.durations[duration];
+    if (!durCfg) return res.json({ ok: false, message: 'bad_duration' });
+    const clean = sanitizeSteps(steps, duration);
+    if (!clean) return res.json({ ok: false, message: 'bad_steps', maxSteps: DURATION_MAX_STEPS[duration] });
+    if (save === true) {
+        durCfg.steps = clean.slice();
+        await saveAppsConfig();
+    }
+    const token = genToken();
+    tasks.set(token, {
+        duration, app: appId, steps: clean.slice(), hours: DURATION_HOURS[duration],
+        maxDevices: normDevices(appCfg.devices),
+        currentStep: 0, completedSteps: 0, totalSteps: clean.length,
+        done: false, key: null, keyExpire: null, createdAt: Date.now(),
+        clientIP: getClientIP(req), clientUA: req.headers['user-agent'] || '',
+        isAdmin: true,
+        stepStartedAt: 0, stepIP: '', stepUA: '', stepNonce: null,
+        bypassed: false, bypassReason: null, callbackHistory: []
+    });
+    setTimeout(() => tasks.delete(token), 30 * 60 * 1000);
+    return res.json({ ok: true, token, app: appId, duration, steps: clean, saved: save === true, taskUrl: `${SERVER_URL}/task?token=${token}` });
 });
 
 // ---- Số thiết bị mỗi key khi get key (admin): 1 / tùy chỉnh / vô hạn ----
@@ -2901,6 +2969,19 @@ ${GUIDE_HTML}
 <button id="tabAdminApp-netsuper" class="active" onclick="switchAdminApp('netsuper')">NetSuper</button>
 <button id="tabAdminApp-netsupervip" onclick="switchAdminApp('netsupervip')">NetSuperVip</button>
 </div>
+<details style="margin:10px 0;padding:12px;border-radius:12px;background:var(--field);border:1px solid var(--line)">
+<summary style="cursor:pointer;font-weight:700;font-size:13px">📖 HƯỚNG DẪN: chỉnh thứ tự link vượt theo từng mốc giờ</summary>
+<ol style="margin:10px 0 0;padding-left:20px;font-size:12.5px;line-height:1.6;color:var(--text-dim)">
+<li>Chọn app ở trên (<b>NetSuper</b> hoặc <b>NetSuperVip</b>) — mỗi app có thứ tự riêng.</li>
+<li>Mỗi mốc giờ (3H, 6H, 8H, 12H, 24H) có một danh sách bước xếp <b>từ trên xuống</b>: người dùng làm bước 1 trước, rồi bước 2, bước 3...</li>
+<li>Bấm <b>+ Link4M / + TrafficVN / + Link999 / + VietUser</b> để thêm bước. Dùng <b>▲ ▼</b> để đổi thứ tự, <b>✕</b> để xoá. Một link được dùng nhiều lần.</li>
+<li>Số bước tối đa mỗi mốc: 3H = 1, 6H = 2, 8H = 3, 12H = 4, 24H = 5.</li>
+<li><b>💾 LƯU CHO TOÀN SERVER</b>: lưu vĩnh viễn, ai lấy key ở mốc giờ đó cũng phải vượt đúng thứ tự này. Hai ô <b>Ẩn / Bảo trì</b> cũng được lưu cùng lúc.</li>
+<li><b>🔗 TẠO LINK THEO THỨ TỰ NÀY</b>: tạo nhiệm vụ ngay theo thứ tự đang chọn mà <b>không lưu</b> — bấm “MỞ LINK” rồi tự vượt để nhận key. Nếu ưng thứ tự đó, bấm “Lưu thứ tự này cho toàn server”; không cần thì bỏ qua.</li>
+<li>Link tạo ngay chỉ dành cho admin (không bị kiểm tra gian lận, không tính lượt IP) — <b>đừng gửi cho người khác</b>. Muốn người khác dùng thì lưu cho toàn server.</li>
+<li>Link999 luôn dùng mốc <b>Google Search 4 Step</b> (type 5), không chọn được mốc khác.</li>
+</ol>
+</details>
 <div id="adminAppPrefixBox" style="padding:12px;margin-top:6px;border-radius:12px;background:var(--field);border:1px solid var(--line)"></div>
 <div id="adminAppDurations"></div>
 
@@ -3206,6 +3287,8 @@ async function addWhitelistIp() {
 
 // ---------- ADMIN: GET KEY THEO APP (hidden / maintenance / thứ tự & số bước link) ----------
 let adminAppConfigCache = null;
+let adminOrder = {};   // 'app|giờ' -> mảng thứ tự link đang chỉnh (chưa lưu)
+let adminShorteners = [{id:'link4m',label:'Link4M',seconds:80},{id:'trafficvn',label:'TrafficVN',seconds:90},{id:'link999',label:'Link999 (Google Search 4 Step)',seconds:90},{id:'vietuser',label:'VietUser',seconds:90}];
 let currentAdminApp = 'netsuper';
 const DURATION_ORDER = ['3h','6h','8h','12h','24h'];
 function switchAdminApp(appId) {
@@ -3220,6 +3303,7 @@ async function syncAdminAppConfig() {
     const j = await r.json();
     if (!j.ok) return;
     adminAppConfigCache = j.apps;
+    if (Array.isArray(j.shorteners)) adminShorteners = j.shorteners;
     renderAdminAppDurations();
   } catch (e) {}
 }
@@ -3273,6 +3357,18 @@ async function saveAppPrefix() {
   if (j.ok) { showMsg('Đã lưu chữ đầu: ' + j.prefix, true); syncAdminAppConfig(); }
   else showMsg('FAIL: ' + (j.message || 'lỗi') + ' (chỉ dùng chữ/số, không dấu -)', false);
 }
+function adminShortenerInfo(id) {
+  return adminShorteners.find(x => x.id === id) || { id: id, label: id, seconds: 90 };
+}
+function adminMkBtn(text, fn, css, cls) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = text;
+  if (cls) b.className = cls;
+  b.style.cssText = 'width:auto;margin:0;padding:6px 10px;font-size:12px;' + (css || '');
+  b.onclick = fn;
+  return b;
+}
 function renderAdminAppDurations() {
   renderAdminAppPrefix();
   const box = document.getElementById('adminAppDurations');
@@ -3281,60 +3377,136 @@ function renderAdminAppDurations() {
   box.innerHTML = '';
   DURATION_ORDER.forEach(dur => {
     const d = durations[dur];
+    if (!d) return;
+    const key = currentAdminApp + '|' + dur;
+    if (!adminOrder[key]) adminOrder[key] = d.steps.slice();
     const maxSteps = d.maxSteps;
+
     const row = document.createElement('div');
     row.style.cssText = 'padding:12px;margin-top:10px;border-radius:12px;background:var(--field);border:1px solid var(--line)';
 
     const head = document.createElement('div');
     head.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap';
     head.innerHTML = '<b style="font-family:var(--font-mono)">' + dur.toUpperCase() + '</b>';
-
     const toggles = document.createElement('div');
-    toggles.style.cssText = 'display:flex;gap:14px;font-size:12px;color:var(--text-dim)';
+    toggles.style.cssText = 'display:flex;gap:14px;font-size:12px;color:var(--text-dim);white-space:nowrap';
     toggles.innerHTML =
       '<label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" id="hid-' + currentAdminApp + '-' + dur + '" ' + (d.hidden ? 'checked' : '') + '> Ẩn</label>' +
       '<label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" id="maint-' + currentAdminApp + '-' + dur + '" ' + (d.maintenance ? 'checked' : '') + '> Bảo trì</label>';
     head.appendChild(toggles);
     row.appendChild(head);
 
-    const stepsWrap = document.createElement('div');
-    stepsWrap.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;margin-top:10px';
-    stepsWrap.id = 'steps-' + currentAdminApp + '-' + dur;
-    for (let i = 0; i < maxSteps; i++) {
-      const sel = document.createElement('select');
-      sel.dataset.slot = i;
-      sel.style.cssText = 'padding:7px 8px;border-radius:8px;background:var(--ink-800);border:1px solid var(--line);color:var(--text);font-size:12px';
-      const cur = d.steps[i] || '';
-      ['', 'link4m', 'trafficvn', 'link999'].forEach(opt => {
-        const o = document.createElement('option');
-        o.value = opt; o.textContent = opt === '' ? '— (không dùng)' : opt;
-        if (opt === cur) o.selected = true;
-        sel.appendChild(o);
-      });
-      stepsWrap.appendChild(sel);
-    }
-    row.appendChild(stepsWrap);
-    row.innerHTML += '<p class="card-sub" style="margin-top:6px">Tối đa ' + maxSteps + ' bước · thứ tự trái → phải · để trống để rút ngắn</p>';
+    const counter = document.createElement('p');
+    counter.className = 'card-sub';
+    counter.style.marginTop = '10px';
+    row.appendChild(counter);
 
-    const saveBtn = document.createElement('button');
-    saveBtn.className = 'btn-purple';
-    saveBtn.style.cssText = 'margin-top:8px;padding:9px 14px;font-size:12.5px';
-    saveBtn.textContent = 'LƯU ' + dur.toUpperCase();
-    saveBtn.onclick = () => saveAdminAppDuration(dur, stepsWrap);
-    row.appendChild(saveBtn);
+    const list = document.createElement('div');
+    list.style.cssText = 'display:flex;flex-direction:column;gap:6px;margin-top:6px';
+    row.appendChild(list);
+
+    const adds = document.createElement('div');
+    adds.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;margin-top:8px';
+    row.appendChild(adds);
+
+    const draw = () => {
+      const arr = adminOrder[key];
+      list.innerHTML = '';
+      arr.forEach((id, i) => {
+        const info = adminShortenerInfo(id);
+        const it = document.createElement('div');
+        it.style.cssText = 'display:flex;align-items:center;gap:6px;padding:8px 10px;border-radius:10px;background:var(--ink-800);border:1px solid var(--line)';
+        const lab = document.createElement('span');
+        lab.style.cssText = 'flex:1;font-size:12.5px;min-width:0';
+        lab.textContent = 'Bước ' + (i + 1) + ': ' + info.label + ' (' + info.seconds + 's)';
+        it.appendChild(lab);
+        const up = adminMkBtn('▲', () => { if (i > 0) { const tmp = arr[i - 1]; arr[i - 1] = arr[i]; arr[i] = tmp; draw(); } });
+        up.disabled = i === 0;
+        const dn = adminMkBtn('▼', () => { if (i < arr.length - 1) { const tmp = arr[i + 1]; arr[i + 1] = arr[i]; arr[i] = tmp; draw(); } });
+        dn.disabled = i === arr.length - 1;
+        const rm = adminMkBtn('✕', () => { arr.splice(i, 1); draw(); }, 'background:rgba(239,68,68,.35)');
+        it.appendChild(up); it.appendChild(dn); it.appendChild(rm);
+        list.appendChild(it);
+      });
+      if (!arr.length) {
+        const e = document.createElement('p');
+        e.className = 'card-sub';
+        e.textContent = 'Chưa có bước nào — bấm nút + bên dưới để thêm.';
+        list.appendChild(e);
+      }
+      adds.querySelectorAll('button').forEach(b => { b.disabled = arr.length >= maxSteps; });
+      counter.textContent = 'Thứ tự link (trên → dưới) · ' + arr.length + '/' + maxSteps + ' bước';
+    };
+
+    adminShorteners.forEach(sh => {
+      adds.appendChild(adminMkBtn('+ ' + sh.label, () => {
+        if (adminOrder[key].length < maxSteps) { adminOrder[key].push(sh.id); draw(); }
+      }, 'background:rgba(34,211,238,.2)'));
+    });
+    draw();
+
+    const acts = document.createElement('div');
+    acts.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-top:12px';
+    acts.appendChild(adminMkBtn('💾 LƯU CHO TOÀN SERVER', () => saveAdminAppDuration(dur), 'flex:1;padding:11px 12px;font-size:12.5px'));
+    acts.appendChild(adminMkBtn('🔗 TẠO LINK THEO THỨ TỰ NÀY', () => adminCreateOrderTask(dur, false), 'flex:1;padding:11px 12px;font-size:12.5px', 'btn-green'));
+    row.appendChild(acts);
+
+    const res = document.createElement('div');
+    res.id = 'ordres-' + currentAdminApp + '-' + dur;
+    res.style.marginTop = '8px';
+    row.appendChild(res);
 
     box.appendChild(row);
   });
 }
-async function saveAdminAppDuration(dur, stepsWrap) {
+async function saveAdminAppDuration(dur) {
+  const key = currentAdminApp + '|' + dur;
   const hidden = document.getElementById('hid-' + currentAdminApp + '-' + dur).checked;
   const maintenance = document.getElementById('maint-' + currentAdminApp + '-' + dur).checked;
-  const steps = Array.from(stepsWrap.querySelectorAll('select')).map(s => s.value).filter(v => v);
+  const steps = (adminOrder[key] || []).slice();
   if (!steps.length) { showMsg('Cần ít nhất 1 bước', false); return; }
   const r = await fetch('/api/apps-config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app: currentAdminApp, duration: dur, hidden, maintenance, steps})});
   const j = await r.json();
-  if (j.ok) { showMsg('Đã lưu ' + dur.toUpperCase() + ' (' + currentAdminApp + ')', true); syncAdminAppConfig(); loadAppDurations(); }
-  else showMsg('Lỗi lưu: ' + (j.message || ''), false);
+  if (j.ok) {
+    delete adminOrder[key];
+    showMsg('Đã lưu ' + dur.toUpperCase() + ' (' + currentAdminApp + ') cho toàn server', true);
+    syncAdminAppConfig(); loadAppDurations();
+  } else showMsg('Lỗi lưu: ' + (j.message || '') + (j.maxSteps ? ' (tối đa ' + j.maxSteps + ' bước)' : ''), false);
+}
+async function adminCreateOrderTask(dur, save) {
+  const key = currentAdminApp + '|' + dur;
+  const steps = (adminOrder[key] || []).slice();
+  if (!steps.length) { showMsg('Cần ít nhất 1 bước', false); return; }
+  const r = await fetch('/api/admin-create-task', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({app: currentAdminApp, duration: dur, steps, save: !!save})});
+  const j = await r.json();
+  if (!j.ok) { showMsg('Lỗi: ' + (j.message || '') + (j.maxSteps ? ' (tối đa ' + j.maxSteps + ' bước)' : ''), false); return; }
+  adminShowOrderResult(dur, j);
+  if (j.saved) { delete adminOrder[key]; showMsg('Đã lưu thứ tự cho toàn server', true); syncAdminAppConfig(); loadAppDurations(); }
+}
+function adminShowOrderResult(dur, j) {
+  const res = document.getElementById('ordres-' + currentAdminApp + '-' + dur);
+  if (!res) return;
+  res.innerHTML = '';
+  const p = document.createElement('p');
+  p.className = 'card-sub';
+  p.style.color = '#34d399';
+  p.textContent = '✅ Đã tạo link (' + j.steps.length + ' bước' + (j.saved ? ', ĐÃ lưu cho toàn server' : ', chưa lưu') + ')';
+  res.appendChild(p);
+  const a = document.createElement('a');
+  a.href = j.taskUrl; a.target = '_blank'; a.rel = 'noopener';
+  a.className = 'btn-green';
+  a.textContent = '▶ MỞ LINK ĐỂ VƯỢT';
+  a.style.cssText = 'display:block;text-align:center;text-decoration:none;padding:12px;border-radius:10px;margin-top:6px;color:#fff;font-weight:700';
+  res.appendChild(a);
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-top:8px';
+  row.appendChild(adminMkBtn('📋 COPY LINK', async () => {
+    try { await navigator.clipboard.writeText(j.taskUrl); showMsg('Đã copy link', true); } catch (e) { showMsg(j.taskUrl, true); }
+  }, 'flex:1;padding:10px'));
+  if (!j.saved) {
+    row.appendChild(adminMkBtn('💾 Lưu thứ tự này cho toàn server', () => adminCreateOrderTask(dur, true), 'flex:1;padding:10px'));
+  }
+  res.appendChild(row);
 }
 
 function formatCountdown(ms) {
@@ -4121,7 +4293,7 @@ async function refresh() {
     if (i < j.completedSteps) { cls='done'; icon='✓'; }
     else if (i === j.currentStep) { cls='current'; icon='▶'; }
     row.className = 'step-row ' + cls;
-    const label = type === 'link4m' ? 'Link4M (80s)' : (type === 'link999' ? 'Link999 (90s)' : 'TrafficVN (90s)');
+    const label = ({link4m:'Link4M (80s)', trafficvn:'TrafficVN (90s)', link999:'Link999 (90s)', vietuser:'VietUser (90s)'})[type] || type;
     row.innerHTML = '<span class="step-icon">' + icon + '</span> ' + t('step') + ' ' + (i+1) + '/' + j.total + ' — ' + label;
     prog.appendChild(row);
   });
