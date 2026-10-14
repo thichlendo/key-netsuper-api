@@ -112,6 +112,28 @@ app.use((req, res, next) => {
     next();
 });
 
+// ============================================
+// 🤖 CHẶN BOT: User-Agent phải giống trình duyệt thật
+//   Ngoại lệ: /api/health (Render / UptimeRobot), /api/check-key (app của bạn có thể dùng UA riêng),
+//   và admin đã đăng nhập.  Biến môi trường:
+//     UA_ALLOW=abc,xyz        -> cho phép thêm UA chứa chữ này
+//     STRICT_UA_CHECKKEY=1    -> bắt cả /api/check-key phải có UA trình duyệt
+// ============================================
+const UA_ALLOW_EXTRA = String(process.env.UA_ALLOW || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+const STRICT_UA_CHECKKEY = process.env.STRICT_UA_CHECKKEY === '1';
+const BAD_BOT_WORDS = ['bot', 'crawler', 'spider', 'scrape', 'scan', 'curl', 'wget', 'python', 'go-http', 'java/', 'okhttp', 'axios', 'postman'];
+app.use((req, res, next) => {
+    if (req.path === '/api/health') return next();
+    if (req.path === '/api/check-key' && !STRICT_UA_CHECKKEY) return next();
+    if (isAdminSession(req)) return next();
+    const ua = String(req.headers['user-agent'] || '').toLowerCase();
+    let ok = ua.length >= 20 && /mozilla|chrome|safari|firefox|edge|opera|opr\/|applewebkit/.test(ua);
+    if (ok) { for (const b of BAD_BOT_WORDS) { if (ua.includes(b)) { ok = false; break; } } }
+    if (!ok && UA_ALLOW_EXTRA.some(x => ua.includes(x))) ok = true;
+    if (!ok) { secViolation(getClientIP(req) || 'unknown'); return res.status(403).end(); }
+    next();
+});
+
 // Body parser: người thường 1MB, admin đã đăng nhập 20MB
 const jsonSmall = express.json({ limit: '1mb' });
 const jsonBig = express.json({ limit: '20mb' });
@@ -262,18 +284,24 @@ async function redisPipeline(commands) {
     } catch (e) { console.error('Pipeline err:', e.message); return null; }
 }
 
+// ⭐ Mỗi key = 1 lệnh SET duy nhất. expireAt lưu ngay trong JSON (không dùng hash ns:meta nữa).
+let keysListCache = { t: 0, data: null };
+const KEYS_LIST_CACHE_MS = 30 * 1000;
+function invalidateKeysCache() { keysListCache = { t: 0, data: null }; }
+let legacyMetaCleaned = false;
+
 async function saveKeyToRedis(key, expireAt, maxDevices = 0, isVip = false) {
     const ttl = Math.max(1, Math.ceil((expireAt - Date.now()) / 1000));
     const value = JSON.stringify({
         hwids: [],
         maxDevices: Number(maxDevices) || 0,
         createdAt: Date.now(),
+        expireAt: expireAt,
         vip: !!isVip
     });
-    return await redisPipeline([
-        ['SET', `ns:key:${key}`, value, 'EX', String(ttl)],
-        ['HSET', 'ns:meta', key, String(expireAt)]
-    ]);
+    const r = await redis('SET', `ns:key:${key}`, value, 'EX', String(ttl));
+    invalidateKeysCache();
+    return r;
 }
 
 async function saveManyKeysToRedis(keysList, expireAt, maxDevices = 0, isVip = false) {
@@ -282,18 +310,15 @@ async function saveManyKeysToRedis(keysList, expireAt, maxDevices = 0, isVip = f
         hwids: [],
         maxDevices: Number(maxDevices) || 0,
         createdAt: Date.now(),
+        expireAt: expireAt,
         vip: !!isVip
     });
     const batchSize = 100;
     for (let i = 0; i < keysList.length; i += batchSize) {
         const batch = keysList.slice(i, i + batchSize);
-        const cmds = [];
-        for (const k of batch) {
-            cmds.push(['SET', `ns:key:${k}`, value, 'EX', String(ttl)]);
-            cmds.push(['HSET', 'ns:meta', k, String(expireAt)]);
-        }
-        await redisPipeline(cmds);
+        await redisPipeline(batch.map(k => ['SET', `ns:key:${k}`, value, 'EX', String(ttl)]));
     }
+    invalidateKeysCache();
     return keysList.length;
 }
 
@@ -303,36 +328,86 @@ async function getKeyFromRedis(key) {
     try { return JSON.parse(value); } catch (e) { return {}; }
 }
 
+// Ghi lại entry nhưng giữ nguyên thời hạn. Có expireAt thì KHÔNG cần hỏi TTL.
+// Key cũ (chưa có expireAt) -> hỏi TTL 1 lần rồi tự chuyển sang định dạng mới.
 async function saveKeyEntry(key, entry) {
-    const ttl = await redis('TTL', `ns:key:${key}`);
-    if (ttl && ttl > 0) {
-        await redis('SET', `ns:key:${key}`, JSON.stringify(entry), 'EX', String(ttl));
-        return true;
+    let ttl;
+    if (entry.expireAt && entry.expireAt > Date.now()) {
+        ttl = Math.max(1, Math.ceil((entry.expireAt - Date.now()) / 1000));
+    } else {
+        const t = await redis('TTL', `ns:key:${key}`);
+        if (!t || t <= 0) return false;
+        ttl = t;
+        entry.expireAt = Date.now() + t * 1000;
     }
-    return false;
+    // XX: chỉ ghi nếu key còn tồn tại (tránh "sống lại" key vừa bị admin xoá)
+    const r = await redis('SET', `ns:key:${key}`, JSON.stringify(entry), 'EX', String(ttl), 'XX');
+    invalidateKeysCache();
+    return r === 'OK';
 }
 
 async function deleteKeyFromRedis(key) {
-    return await redisPipeline([
-        ['DEL', `ns:key:${key}`],
-        ['HDEL', 'ns:meta', key]
-    ]);
+    const r = await redis('DEL', `ns:key:${key}`);
+    invalidateKeysCache();
+    return r;
 }
 
+// ⭐ BƯỚC 7: SCAN + MGET (mỗi lệnh MGET đọc 100 key = chỉ 1 lệnh), có cache RAM 30s
 async function listKeysFromRedis() {
     const now = Date.now();
-    const meta = await redis('HGETALL', 'ns:meta');
-    if (!meta || !Array.isArray(meta) || meta.length === 0) return [];
-    const result = [], expired = [];
-    for (let i = 0; i < meta.length; i += 2) {
-        const key = meta[i];
-        const expireAt = parseInt(meta[i + 1], 10);
-        if (!key || isNaN(expireAt)) continue;
-        if (expireAt > now) result.push({ key, expireAt });
-        else expired.push(key);
+    if (keysListCache.data && now - keysListCache.t < KEYS_LIST_CACHE_MS) return keysListCache.data;
+
+    let failed = false;
+    const names = new Set();
+    let cursor = '0', guard = 0;
+    do {
+        const r = await redis('SCAN', cursor, 'MATCH', 'ns:key:*', 'COUNT', '500');
+        if (!Array.isArray(r)) { failed = true; break; }
+        cursor = String(r[0]);
+        if (Array.isArray(r[1])) r[1].forEach(k => names.add(k));
+        guard++;
+    } while (cursor !== '0' && guard < 2000);
+
+    const uniq = Array.from(names);
+    const rows = [];
+    for (let i = 0; i < uniq.length && !failed; i += 100) {
+        const chunk = uniq.slice(i, i + 100);
+        const vals = await redis('MGET', ...chunk);
+        if (!Array.isArray(vals)) { failed = true; break; }
+        chunk.forEach((full, idx) => {
+            const raw = vals[idx];
+            if (!raw) return;
+            let entry;
+            try { entry = JSON.parse(raw); } catch (e) { entry = {}; }
+            rows.push({ key: full.slice(7), entry, expireAt: Number(entry.expireAt) || 0 });
+        });
     }
-    if (expired.length) await redisPipeline(expired.map(k => ['HDEL', 'ns:meta', k]));
-    return result;
+
+    // Key cũ (tạo trước khi bỏ ns:meta): lấy hạn từ hash cũ, không có thì hỏi TTL
+    const legacy = rows.filter(r => !r.expireAt);
+    if (legacy.length && !failed) {
+        const meta = await redis('HGETALL', 'ns:meta');
+        const map = new Map();
+        if (Array.isArray(meta)) for (let i = 0; i < meta.length; i += 2) map.set(meta[i], parseInt(meta[i + 1], 10));
+        const still = [];
+        legacy.forEach(r => { const v = map.get(r.key); if (v && !isNaN(v)) r.expireAt = v; else still.push(r); });
+        for (let i = 0; i < still.length; i += 100) {
+            const chunk = still.slice(i, i + 100);
+            const ttls = await redisPipeline(chunk.map(r => ['TTL', `ns:key:${r.key}`]));
+            chunk.forEach((r, idx) => {
+                const t = ttls && ttls[idx] && ttls[idx].result;
+                if (t && t > 0) r.expireAt = now + t * 1000;
+            });
+        }
+    } else if (!legacy.length && !failed && !legacyMetaCleaned) {
+        legacyMetaCleaned = true;
+        await redis('DEL', 'ns:meta');   // dọn hash cũ khi không còn key nào dùng định dạng cũ
+    }
+
+    const data = rows.filter(r => r.expireAt > now).map(r => ({ key: r.key, expireAt: r.expireAt, entry: r.entry }));
+    if (failed && keysListCache.data) return keysListCache.data;
+    keysListCache = { t: Date.now(), data };
+    return data;
 }
 
 // ============================================
@@ -353,6 +428,8 @@ let siteConfigCache = {
 };
 let whitelistCache = new Set();
 
+let siteStatusCacheTime = 0;
+let siteStatusCacheData = null;
 async function loadSiteConfig() {
     const raw = await redis('GET', 'ns:site:config');
     if (raw) {
@@ -362,6 +439,7 @@ async function loadSiteConfig() {
 }
 async function saveSiteConfig(patch) {
     siteConfigCache = { ...siteConfigCache, ...patch };
+    siteStatusCacheData = null;   // đổi trạng thái thì bỏ cache ngay
     await redis('SET', 'ns:site:config', JSON.stringify(siteConfigCache));
     return siteConfigCache;
 }
@@ -437,12 +515,23 @@ loadAppsConfig();
 // ============================================
 // PER-IP GET-KEY COUNTER (vĩnh viễn, không reset)
 // ============================================
+const ipCountCache = new Map();   // ip -> { n, t }
+const IP_COUNT_CACHE_MS = 10 * 60 * 1000;
 async function getIpGetKeyCount(ip) {
+    const c = ipCountCache.get(ip);
+    if (c && Date.now() - c.t < IP_COUNT_CACHE_MS) return c.n;
     const v = await redis('HGET', 'ns:ip:getkeycount', ip);
-    return parseInt(v, 10) || 0;
+    const n = parseInt(v, 10) || 0;
+    if (ipCountCache.size > 50000) ipCountCache.clear();
+    ipCountCache.set(ip, { n, t: Date.now() });
+    return n;
 }
 async function incrIpGetKeyCount(ip) {
-    return await redis('HINCRBY', 'ns:ip:getkeycount', ip, 1);
+    const v = await redis('HINCRBY', 'ns:ip:getkeycount', ip, 1);
+    const n = parseInt(v, 10);
+    const prev = ipCountCache.get(ip);
+    ipCountCache.set(ip, { n: Number.isFinite(n) ? n : ((prev ? prev.n : 0) + 1), t: Date.now() });
+    return v;
 }
 
 // ============================================
@@ -618,57 +707,147 @@ function stepsForHours(h) {
     if (h >= 6)  return ['link4m','trafficvn'];
     return ['link4m'];
 }
-// Link kiểu /st?api=TOKEN&url=DEST: server tự gọi và đọc link rút gọn (không lộ token cho người dùng)
-async function genStLink(baseUrl, token, cb, extra) {
-    const params = new URLSearchParams(Object.assign({ api: token, url: cb }, extra || {}));
-    const r = await fetch(`${baseUrl}?${params}`, {
-        redirect: 'manual',
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; NetSuperKeyServer/1.0)', 'Accept': 'text/html,application/json,*/*' }
-    });
+// ============================================
+// 🔗 TẠO LINK RÚT GỌN: Link4M / TrafficVN / Link999 / VietUser
+//   Link999 + VietUser dùng kiểu quick-link:  https://<site>/st?api=TOKEN&url=ĐÍCH[&type=5]
+//   -> mở link đó là bị chuyển hướng sang link rút gọn. Server tự mở và lấy link đó.
+// ============================================
+const SHORT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const SHORT_TIMEOUT_MS = 9000;
+const shortenerLast = {};   // id -> { time, ok, ms, note }  (lỗi gần nhất, admin xem được)
+
+function maskSecrets(str) {
+    let t = String(str);
+    [LINK4M_API_KEY, TRAFFICVN_API_KEY, LINK999_API_KEY, VIETUSER_API_KEY].forEach(k => { if (k) t = t.split(k).join('***'); });
+    return t;
+}
+function shortHeaders() {
+    return {
+        'User-Agent': SHORT_UA,
+        'Accept': 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7'
+    };
+}
+// Link nhìn có giống link rút gọn không (loại trang chủ / đăng nhập / lỗi)
+function looksLikeShortLink(u) {
+    const p = u.pathname.replace(/\/+$/, '');
+    if (!p) return false;
+    if (/^\/(login|signin|register|signup|error|member|auth|account|dashboard|contact|terms|privacy|404|403)(\/|$)/i.test(p)) return false;
+    return true;
+}
+async function stFetch(url, jar) {
+    const host = new URL(url).hostname;
+    const headers = shortHeaders();
+    if (jar[host]) headers['Cookie'] = jar[host];
+    const r = await fetch(url, { redirect: 'manual', headers, signal: AbortSignal.timeout(SHORT_TIMEOUT_MS) });
+    let sc = [];
+    try { sc = typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : []; } catch (e) {}
+    if (sc.length) jar[host] = (jar[host] ? jar[host] + '; ' : '') + sc.map(c => String(c).split(';')[0]).join('; ');
+    return r;
+}
+// Đọc 1 phản hồi -> { link } (đã có link rút gọn) | { next } (URL cần đi tiếp) | {}
+async function stRead(r, reqUrl, trace) {
     const loc = r.headers.get('location');
-    if (loc && /^https?:\/\//i.test(loc)) return loc;
+    const ct = String(r.headers.get('content-type') || '').split(';')[0] || 'no-content-type';
+    trace.push('HTTP ' + r.status + ' [' + ct + ']' + (loc ? ' -> ' + String(loc).slice(0, 140) : ''));
+    if (loc) {
+        try { return { next: new URL(loc, reqUrl).href }; } catch (e) { return {}; }   // hỗ trợ cả Location tương đối
+    }
     const body = await r.text().catch(() => '');
+    trace.push('body: ' + body.replace(/\s+/g, ' ').slice(0, 200));
     if (/^\s*[{\[]/.test(body)) {
         try {
             const j = JSON.parse(body);
-            const u = j.shortenedUrl || j.short_url || j.shortlink || j.url || null;
-            if (u && /^https?:\/\//i.test(u)) return u;
+            const u = j.shortenedUrl || j.short_url || j.shortlink || j.shortLink || j.link || j.url || null;
+            if (u && /^https?:\/\//i.test(u)) return { link: u };
+            if (j.message || j.msg || j.error) trace.push('loi tu dich vu: ' + String(j.message || j.msg || j.error).slice(0, 160));
         } catch (e) {}
+        return {};
     }
-    const m = body.match(/http-equiv=["']?refresh["']?[^>]*url=([^"'>\s]+)/i) || body.match(/window\.location(?:\.href)?\s*=\s*["']([^"']+)["']/i);
-    if (m && /^https?:\/\//i.test(m[1])) return m[1];
+    const m = body.match(/http-equiv=["']?refresh["']?[^>]*url=([^"'>\s]+)/i)
+        || body.match(/location(?:\.href)?\s*=\s*["']([^"']+)["']/i)
+        || body.match(/location\.replace\(\s*["']([^"']+)["']/i);
+    if (m) { try { return { next: new URL(m[1], reqUrl).href }; } catch (e) {} }
     const txt = body.trim();
-    if (/^https?:\/\/\S+$/i.test(txt)) return txt;
-    console.error('genStLink: không lấy được link rút gọn, status', r.status, baseUrl);
+    if (/^https?:\/\/\S+$/i.test(txt)) return { link: txt };
+    return {};
+}
+// Cách 1 (đúng như doc của dịch vụ): mở /st?api=..&url=.. rồi lấy link bị chuyển hướng tới
+async function genStLink(baseUrl, token, cb, extra, trace) {
+    const base = new URL(baseUrl);
+    const jar = {};
+    let cur = baseUrl + '?' + new URLSearchParams(Object.assign({ api: token, url: cb }, extra || {}));
+    for (let hop = 0; hop < 5; hop++) {
+        const r = await stFetch(cur, jar);
+        const x = await stRead(r, cur, trace);
+        if (x.link) return x.link;
+        if (!x.next) return null;
+        const n = new URL(x.next);
+        // vẫn là bước nội bộ của /st (cookie, chuẩn hoá URL...) -> đi tiếp
+        if (n.hostname === base.hostname && n.pathname === base.pathname) { cur = n.href; continue; }
+        if (!looksLikeShortLink(n)) { trace.push('bo qua (khong giong link rut gon): ' + n.href.slice(0, 120)); return null; }
+        return n.href;
+    }
     return null;
 }
-async function genShortLink(type, cb) {
+// Cách 2 (dự phòng): /api?api=..&url=..&format=json|text
+async function genApiLink(apiUrl, token, cb, extra, fmt, trace) {
+    const params = new URLSearchParams(Object.assign({ api: token, url: cb, format: fmt }, extra || {}));
+    const r = await fetch(apiUrl + '?' + params, { redirect: 'manual', headers: shortHeaders(), signal: AbortSignal.timeout(SHORT_TIMEOUT_MS) });
+    const x = await stRead(r, apiUrl, trace);
+    return x.link || null;
+}
+const ST_SHORTENERS = {
+    link999:  { base: LINK999_API_URL,  token: () => LINK999_API_KEY,  extra: { type: LINK999_TYPE } },   // luôn type=5
+    vietuser: { base: VIETUSER_API_URL, token: () => VIETUSER_API_KEY, extra: {} }
+};
+async function genStShort(id, cb, trace) {
+    const c = ST_SHORTENERS[id];
+    const token = c.token();
+    trace.push('Cach 1: ' + c.base);
+    try { const u = await genStLink(c.base, token, cb, c.extra, trace); if (u) return u; }
+    catch (e) { trace.push('Cach 1 loi: ' + e.message); }
+    const apiUrl = new URL(c.base).origin + '/api';
+    for (const fmt of ['json', 'text']) {
+        trace.push('Cach 2 (' + fmt + '): ' + apiUrl);
+        try { const u = await genApiLink(apiUrl, token, cb, c.extra, fmt, trace); if (u) return u; }
+        catch (e) { trace.push('Cach 2 loi: ' + e.message); }
+    }
+    return null;
+}
+async function genShortLink(type, cb, traceArg) {
+    const trace = Array.isArray(traceArg) ? traceArg : [];
+    const t0 = Date.now();
+    let url = null;
     try {
-        let url = null;
         if (type === 'link4m') {
             const params = new URLSearchParams({ api: LINK4M_API_KEY, url: cb, format: 'json' });
-            const r = await fetch(`${LINK4M_API_URL}?${params}`);
+            const r = await fetch(`${LINK4M_API_URL}?${params}`, { signal: AbortSignal.timeout(SHORT_TIMEOUT_MS) });
             const j = await r.json();
             if (j.status === 'success' && j.shortenedUrl) url = j.shortenedUrl;
-        } else if (type === 'link999') {
-            // Link999: LUÔN dùng type=5 (Google Search 4 Step)
-            url = await genStLink(LINK999_API_URL, LINK999_API_KEY, cb, { type: LINK999_TYPE });
-        } else if (type === 'vietuser') {
-            url = await genStLink(VIETUSER_API_URL, VIETUSER_API_KEY, cb);
+            else trace.push('Link4M tra ve: ' + JSON.stringify(j).slice(0, 200));
+        } else if (ST_SHORTENERS[type]) {
+            url = await genStShort(type, cb, trace);
         } else {
             const params = new URLSearchParams({ api: TRAFFICVN_API_KEY, url: cb, fallback_url: cb });
-            const r = await fetch(`${TRAFFICVN_API_URL}?${params}`);
+            const r = await fetch(`${TRAFFICVN_API_URL}?${params}`, { signal: AbortSignal.timeout(SHORT_TIMEOUT_MS) });
             const j = await r.json();
             url = j.shortenedUrl || j.short_url || j.url || null;
+            if (!url) trace.push('TrafficVN tra ve: ' + JSON.stringify(j).slice(0, 200));
         }
-        if (!url) return null;
-        // An toàn: nếu dịch vụ trả thẳng về trang của mình (lỗi token / không rút gọn) thì KHÔNG đưa cho người dùng, tránh bị lọt bước
-        try {
-            if (new URL(url).hostname === new URL(SERVER_URL).hostname) { console.error('genShortLink: link trả về trùng domain server, bỏ qua', type); return null; }
-        } catch (e) { return null; }
-        return url;
-    } catch (e) { console.error('genShortLink err:', e.message); }
-    return null;
+        if (url && !/^https?:\/\//i.test(url)) { trace.push('link khong hop le: ' + String(url).slice(0, 80)); url = null; }
+        // An toàn: nếu dịch vụ trả thẳng về trang của mình (lỗi token / không rút gọn) thì KHÔNG đưa cho người dùng, tránh lọt bước
+        if (url && new URL(url).hostname === new URL(SERVER_URL).hostname) {
+            trace.push('link tra ve trung domain server -> bo qua');
+            url = null;
+        }
+    } catch (e) {
+        trace.push('Loi: ' + e.message);
+        url = null;
+    }
+    shortenerLast[type] = { time: Date.now(), ok: !!url, ms: Date.now() - t0, note: url ? '' : maskSecrets(trace.join(' | ')).slice(0, 900) };
+    if (!url) console.error('genShortLink ' + type + ' that bai: ' + shortenerLast[type].note);
+    return url;
 }
 function calcExpire(t) {
     if (t.permanent) return { expireAt: PERMANENT_EXPIRE_AT(), isPermanent: true };
@@ -695,7 +874,7 @@ function totalHoursOf(t) {
 app.get('/api/check-key', async (req, res) => {
     const key = req.query.key;
     const hwid = String(req.query.hwid || req.query.device_id || '').trim();
-    if (!key) return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
+    if (!key || typeof key !== 'string' || key.length > 128) return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
 
     const entry = await getKeyFromRedis(key);
     if (!entry) return res.json({ p: JSON.stringify({ ok: 0 }), s: 'x' });
@@ -717,10 +896,19 @@ app.get('/api/check-key', async (req, res) => {
         }
     }
 
-    const ttl = await redis('TTL', `ns:key:${key}`);
-    const exp = (ttl && ttl > 0)
-        ? Math.floor((Date.now() + ttl * 1000) / 1000)
-        : Math.floor(Date.now() / 1000) + 3600;
+    let expireAt = Number(entry.expireAt) || 0;
+    if (!expireAt) {
+        // key cũ chưa có expireAt: hỏi TTL 1 lần rồi ghi lại, từ lần sau chỉ còn 1 lệnh GET
+        const ttl = await redis('TTL', `ns:key:${key}`);
+        if (ttl && ttl > 0) {
+            expireAt = Date.now() + ttl * 1000;
+            entry.expireAt = expireAt;
+            await saveKeyEntry(key, entry);
+        } else {
+            expireAt = Date.now() + 3600 * 1000;
+        }
+    }
+    const exp = Math.floor(expireAt / 1000);
     return res.json({ p: JSON.stringify({ ok: 1, exp, maxDevices, devices: entry.hwids.length }), s: 'x' });
 });
 
@@ -879,6 +1067,7 @@ app.post('/api/verify-admin', (req, res) => res.json({ isAdmin: isAdmin(req) }))
 // ---- Site status (public read) ----
 app.get('/api/site-status', (req, res) => {
     const admin = isAdmin(req);
+    if (!admin && siteStatusCacheData && Date.now() - siteStatusCacheTime < 60000) return res.json(siteStatusCacheData);
     const payload = {
         ok: true,
         status: siteConfigCache.status,
@@ -887,6 +1076,7 @@ app.get('/api/site-status', (req, res) => {
         isAdmin: admin
     };
     if (admin) { payload.maintMsg = siteConfigCache.maintMsg; payload.offMsg = siteConfigCache.offMsg; }
+    else { siteStatusCacheData = payload; siteStatusCacheTime = Date.now(); }
     res.json(payload);
 });
 
@@ -975,6 +1165,20 @@ app.post('/api/apps-prefix', async (req, res) => {
     if (tailStyle === 'alnum12' || tailStyle === 'special9') appsConfigCache[appId].tailStyle = tailStyle;
     await saveAppsConfig();
     return res.json({ ok: true, app: appId, prefix: clean, tailStyle: appsConfigCache[appId].tailStyle });
+});
+
+// ---- Admin: thử tạo link ở cả 4 dịch vụ rút gọn và xem chi tiết lỗi ----
+app.post('/api/shortener-test', async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false });
+    const results = await Promise.all(SHORTENER_IDS.map(async id => {
+        const trace = [];
+        const t0 = Date.now();
+        const cb = `${SERVER_URL}/api/step-callback?token=TEST&step=0&n=TEST&r=${Date.now()}`;
+        let url = null;
+        try { url = await genShortLink(id, cb, trace); } catch (e) { trace.push('Loi: ' + e.message); }
+        return { id, label: SHORTENERS[id].label, ok: !!url, ms: Date.now() - t0, url: url || null, trace: trace.map(maskSecrets) };
+    }));
+    return res.json({ ok: true, results });
 });
 
 // ---- Admin: chọn mốc giờ + thứ tự link rồi tạo nhiệm vụ ngay; save=true thì lưu thứ tự đó cho TOÀN SERVER ----
@@ -1144,17 +1348,18 @@ app.post('/api/key-update', async (req, res) => {
     if (removeHwid) entry.hwids = entry.hwids.filter(h => h !== removeHwid);
     if (typeof setVip === 'boolean') entry.vip = setVip;
 
-    let ttl = await redis('TTL', `ns:key:${key}`);
+    let ttl = (entry.expireAt && entry.expireAt > Date.now())
+        ? Math.ceil((entry.expireAt - Date.now()) / 1000)
+        : await redis('TTL', `ns:key:${key}`);
     if (!ttl || ttl <= 0) return res.json({ ok: false, message: 'expired' });
     const add = Number(addHours) || 0;
     if (add) {
         ttl = Math.max(60, ttl + Math.round(add * 3600));
         ttl = Math.min(ttl, PERMANENT_TTL_SEC);
     }
-    await redisPipeline([
-        ['SET', `ns:key:${key}`, JSON.stringify(entry), 'EX', String(ttl)],
-        ['HSET', 'ns:meta', key, String(Date.now() + ttl * 1000)]
-    ]);
+    entry.expireAt = Date.now() + ttl * 1000;
+    await redis('SET', `ns:key:${key}`, JSON.stringify(entry), 'EX', String(ttl));
+    invalidateKeysCache();
     return res.json({
         ok: true, key, expireAt: Date.now() + ttl * 1000,
         maxDevices: Number(entry.maxDevices) || 0, devices: entry.hwids.length, vip: !!entry.vip
@@ -1169,31 +1374,44 @@ app.post('/api/keys-bulk', async (req, res) => {
     if (!keys.length) return res.json({ ok: false, message: 'no_keys' });
     if (action === 'delete') {
         for (let i = 0; i < keys.length; i += 100) {
-            const cmds = [];
-            keys.slice(i, i + 100).forEach(k => { cmds.push(['DEL', `ns:key:${k}`]); cmds.push(['HDEL', 'ns:meta', k]); });
-            await redisPipeline(cmds);
+            await redis('DEL', ...keys.slice(i, i + 100).map(k => `ns:key:${k}`));   // 1 lệnh xoá tối đa 100 key
         }
+        invalidateKeysCache();
         return res.json({ ok: true, action, count: keys.length });
     }
     if (action === 'reset') {
         let done = 0;
         for (let i = 0; i < keys.length; i += 100) {
             const chunk = keys.slice(i, i + 100);
-            const got = await redisPipeline(chunk.map(k => ['GET', `ns:key:${k}`]));
-            const ttls = await redisPipeline(chunk.map(k => ['TTL', `ns:key:${k}`]));
-            const cmds = [];
-            chunk.forEach((k, idx) => {
-                const raw = got && got[idx] && got[idx].result;
-                const ttl = ttls && ttls[idx] && ttls[idx].result;
-                if (!raw || !ttl || ttl <= 0) return;
+            const vals = await redis('MGET', ...chunk.map(k => `ns:key:${k}`));
+            const parsed = chunk.map((k, idx) => {
+                const raw = Array.isArray(vals) ? vals[idx] : null;
+                if (!raw) return null;
                 let e = {};
                 try { e = JSON.parse(raw); } catch (err) {}
+                return e;
+            });
+            // chỉ key cũ (chưa có expireAt) mới phải hỏi TTL
+            const needTtl = [];
+            parsed.forEach((e, idx) => { if (e && !(e.expireAt && e.expireAt > Date.now())) needTtl.push(idx); });
+            const ttlMap = {};
+            if (needTtl.length) {
+                const ttls = await redisPipeline(needTtl.map(idx => ['TTL', `ns:key:${chunk[idx]}`]));
+                needTtl.forEach((idx, j) => { ttlMap[idx] = ttls && ttls[j] && ttls[j].result; });
+            }
+            const cmds = [];
+            parsed.forEach((e, idx) => {
+                if (!e) return;
+                const ttl = (e.expireAt && e.expireAt > Date.now()) ? Math.ceil((e.expireAt - Date.now()) / 1000) : ttlMap[idx];
+                if (!ttl || ttl <= 0) return;
                 e.hwids = []; delete e.hwid;
-                cmds.push(['SET', `ns:key:${k}`, JSON.stringify(e), 'EX', String(ttl)]);
+                e.expireAt = Date.now() + ttl * 1000;
+                cmds.push(['SET', `ns:key:${chunk[idx]}`, JSON.stringify(e), 'EX', String(ttl), 'XX']);
                 done++;
             });
             if (cmds.length) await redisPipeline(cmds);
         }
+        invalidateKeysCache();
         return res.json({ ok: true, action, count: done });
     }
     return res.json({ ok: false, message: 'bad_action' });
@@ -1295,19 +1513,10 @@ app.post('/api/vip-admin-create', async (req, res) => {
 app.post('/api/list-keys', async (req, res) => {
     if (!isAdmin(req)) return res.status(403).json({ ok: false });
     const list = await listKeysFromRedis();
-    const entries = new Array(list.length).fill(null);
-    for (let i = 0; i < list.length; i += 200) {
-        const chunk = list.slice(i, i + 200);
-        const got = await redisPipeline(chunk.map(v => ['GET', `ns:key:${v.key}`]));
-        chunk.forEach((v, idx) => {
-            const raw = got && got[idx] && got[idx].result;
-            if (raw) { try { entries[i + idx] = JSON.parse(raw); } catch (e) { entries[i + idx] = {}; } }
-        });
-    }
     const out = [];
-    list.forEach((v, idx) => {
-        const entry = entries[idx];
-        if (!entry) return; // key đã hết hạn/bị xoá trong Redis nhưng meta còn sót
+    list.forEach(v => {
+        const entry = v.entry;
+        if (!entry) return;
         const hw = Array.isArray(entry.hwids) ? entry.hwids : (entry.hwid ? [entry.hwid] : []);
         out.push({
             key: v.key,
@@ -1329,9 +1538,12 @@ app.post('/api/bypass-log', (req, res) => {
     return res.json({ ok: true, logs: bypassLog.slice(0, 50) });
 });
 
+let healthCache = { t: 0, v: null };
 app.get('/api/health', async (req, res) => {
+    if (healthCache.v !== null && Date.now() - healthCache.t < 60000) return res.json({ ok: true, redis: healthCache.v });
     const ping = await redis('PING');
-    res.json({ ok: true, redis: ping === 'PONG' });
+    healthCache = { t: Date.now(), v: ping === 'PONG' };
+    res.json({ ok: true, redis: healthCache.v });
 });
 
 // ============================================
@@ -2982,6 +3194,10 @@ ${GUIDE_HTML}
 <li>Link999 luôn dùng mốc <b>Google Search 4 Step</b> (type 5), không chọn được mốc khác.</li>
 </ol>
 </details>
+<div style="margin:10px 0">
+<button class="btn-purple" type="button" onclick="testShorteners()" style="margin-top:0">🧪 KIỂM TRA TẠO LINK (Link4M · TrafficVN · Link999 · VietUser)</button>
+<div id="shortenerTestBox" style="margin-top:8px"></div>
+</div>
 <div id="adminAppPrefixBox" style="padding:12px;margin-top:6px;border-radius:12px;background:var(--field);border:1px solid var(--line)"></div>
 <div id="adminAppDurations"></div>
 
@@ -3203,7 +3419,7 @@ async function refreshStatusDot() {
   } catch (e) {}
 }
 refreshStatusDot();
-setInterval(refreshStatusDot, 15000);
+setInterval(refreshStatusDot, 60000);
 
 let clientIsAdmin = false;
 (async () => {
@@ -3356,6 +3572,41 @@ async function saveAppPrefix() {
   const j = await r.json();
   if (j.ok) { showMsg('Đã lưu chữ đầu: ' + j.prefix, true); syncAdminAppConfig(); }
   else showMsg('FAIL: ' + (j.message || 'lỗi') + ' (chỉ dùng chữ/số, không dấu -)', false);
+}
+let shortenerTestText = '';
+async function testShorteners() {
+  const box = document.getElementById('shortenerTestBox');
+  if (!box) return;
+  box.innerHTML = '<p class="card-sub">Đang thử tạo link ở từng dịch vụ (có thể mất vài chục giây)...</p>';
+  shortenerTestText = '';
+  try {
+    const r = await fetch('/api/shortener-test', {method: 'POST'});
+    const j = await r.json();
+    if (!j.ok) { box.innerHTML = '<p class="card-sub" style="color:#f87171">Không chạy được (cần đăng nhập admin)</p>'; return; }
+    box.innerHTML = '';
+    j.results.forEach(x => {
+      const card = document.createElement('div');
+      card.style.cssText = 'padding:10px;margin-top:6px;border-radius:10px;background:var(--field);border:1px solid ' + (x.ok ? 'rgba(52,211,153,.5)' : 'rgba(248,113,113,.5)');
+      const h = document.createElement('div');
+      h.style.cssText = 'font-size:13px;font-weight:700';
+      h.textContent = (x.ok ? '✅ ' : '❌ ') + x.label + ' — ' + x.ms + 'ms';
+      card.appendChild(h);
+      const pre = document.createElement('pre');
+      pre.style.cssText = 'margin:6px 0 0;white-space:pre-wrap;word-break:break-all;font-size:11px;color:var(--text-dim);font-family:var(--font-mono)';
+      pre.textContent = x.ok ? x.url : x.trace.join('\\n');
+      card.appendChild(pre);
+      box.appendChild(card);
+      shortenerTestText += (x.ok ? 'OK  ' : 'LOI ') + x.label + ' (' + x.ms + 'ms)\\n' + (x.ok ? x.url : x.trace.join('\\n')) + '\\n\\n';
+    });
+    const cp = document.createElement('button');
+    cp.type = 'button';
+    cp.textContent = '📋 COPY KẾT QUẢ';
+    cp.style.cssText = 'width:auto;margin:8px 0 0;padding:8px 12px;font-size:12px';
+    cp.onclick = async () => { try { await navigator.clipboard.writeText(shortenerTestText); showMsg('Đã copy kết quả', true); } catch (e) { showMsg('Không copy được', false); } };
+    box.appendChild(cp);
+  } catch (e) {
+    box.innerHTML = '<p class="card-sub" style="color:#f87171">Lỗi: ' + e.message + '</p>';
+  }
 }
 function adminShortenerInfo(id) {
   return adminShorteners.find(x => x.id === id) || { id: id, label: id, seconds: 90 };
@@ -4343,9 +4594,9 @@ async function refreshStatusDot() {
   } catch (e) {}
 }
 refreshStatusDot();
-setInterval(refreshStatusDot, 15000);
+setInterval(refreshStatusDot, 60000);
 refresh();
-polling = setInterval(refresh, 3000);
+polling = setInterval(refresh, 10000);
 </script>
 <script>${PROTECT_JS}</script>
 ${THEME_JS}
@@ -4636,7 +4887,7 @@ setInterval(function(){
   }
   if(expired)apply();
 },1000);
-setInterval(function(){load(false)},15000);
+setInterval(function(){load(false)},60000);
 load(true);
 </script>
 </body></html>
