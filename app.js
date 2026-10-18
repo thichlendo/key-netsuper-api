@@ -197,11 +197,10 @@ const LINK999_API_KEY = process.env.LINK999_API_KEY || Buffer.from(LINK999_API_K
 const LINK999_API_URL = 'https://link999.app/api';
 const LINK999_ST_URL = 'https://link999.app/st';
 const LINK999_TYPE = '5';   // CỐ ĐỊNH: luôn dùng mốc 5 = Google Search 4 Step
-// VietUser (token che bằng base64, có thể ghi đè bằng env VIETUSER_API_KEY)
-const VIETUSER_API_KEY_B64 = 'NTQ1MjdhODkwZDMzZmQzYWMxYWZkZWU2MzQzMGI3NmM1OTU0ZTI2YzM5YWMzMDAwMjVmNTE3OTc5NzU5NzA2MA==';
-const VIETUSER_API_KEY = process.env.VIETUSER_API_KEY || Buffer.from(VIETUSER_API_KEY_B64, 'base64').toString('utf8');
-const VIETUSER_API_URL = 'https://vietuser.com/api-shorten/v2';
-const VIETUSER_ST_URL = 'https://vietuser.com/st';
+// SiteTop (token che bằng base64, có thể ghi đè bằng env SITETOP_API_KEY)
+const SITETOP_API_KEY_B64 = 'Y0FPZWVkR2xoQ29qZDNBY05KdG5BVUk1';
+const SITETOP_API_KEY = process.env.SITETOP_API_KEY || Buffer.from(SITETOP_API_KEY_B64, 'base64').toString('utf8');
+const SITETOP_API_URL = 'https://sitetop.net/api';
 // Layma (token che bằng base64, có thể ghi đè bằng env LAYMA_API_KEY)
 const LAYMA_API_KEY_B64 = 'YWVmNzhmYjc4YTUzMTIyYWIwNzcyYjcxMmY1YjEyNTE=';
 const LAYMA_API_KEY = process.env.LAYMA_API_KEY || Buffer.from(LAYMA_API_KEY_B64, 'base64').toString('utf8');
@@ -225,16 +224,16 @@ const VIP_PACKAGES = {
 const MIN_LINK4M_MS = 80 * 1000;
 const MIN_TRAFFICVN_MS = 90 * 1000;
 const MIN_LINK999_MS = (Number(process.env.LINK999_MIN_SECONDS) || 90) * 1000;
-const MIN_VIETUSER_MS = (Number(process.env.VIETUSER_MIN_SECONDS) || 90) * 1000;
+const MIN_SITETOP_MS = (Number(process.env.SITETOP_MIN_SECONDS) || 90) * 1000;
 const MIN_LAYMA_MS = (Number(process.env.LAYMA_MIN_SECONDS) || 90) * 1000;
 
-// ✅ ĐÃ SỬA: Bổ sung đầy đủ các tên miền xoay vòng của Link4M (link4m.net, link4m.org, link4m.me, link4m.io...)
+// ✅ ĐÃ SỬA: Bổ sung đầy đủ các tên miền xoay vòng của Link4M và tên miền SiteTop (sitetop.net)
 const VALID_REFERERS = [
     'link4m.co','www.link4m.co','link4m.com','www.link4m.com',
     'link4m.net','www.link4m.net','link4m.org','www.link4m.org','link4m.me','www.link4m.me','link4m.io','www.link4m.io',
     'trafficvn.com','www.trafficvn.com',
     'link999.app','www.link999.app',
-    'vietuser.com','www.vietuser.com',
+    'sitetop.net','www.sitetop.net',
     'layma.net','www.layma.net','api.layma.net'
 ].concat(String(process.env.EXTRA_REFERERS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean));
 
@@ -242,7 +241,7 @@ const SHORTENERS = {
     link4m:    { label: 'Link4M',                        minMs: MIN_LINK4M_MS },
     trafficvn: { label: 'TrafficVN',                     minMs: MIN_TRAFFICVN_MS },
     link999:   { label: 'Link999 (Google Search 4 Step)', minMs: MIN_LINK999_MS },
-    vietuser:  { label: 'VietUser',                      minMs: MIN_VIETUSER_MS },
+    sitetop:   { label: 'SiteTop',                       minMs: MIN_SITETOP_MS },
     layma:     { label: 'Layma',                         minMs: MIN_LAYMA_MS }
 };
 const SHORTENER_IDS = Object.keys(SHORTENERS);
@@ -587,7 +586,9 @@ async function loadAppsConfig() {
                         if (parsed[appId].durations && parsed[appId].durations[dur]) {
                             const fallbackSteps = merged[appId].durations[dur].steps;
                             merged[appId].durations[dur] = { ...merged[appId].durations[dur], ...parsed[appId].durations[dur] };
-                            const okSteps = (merged[appId].durations[dur].steps || []).filter(x => SHORTENER_IDS.includes(x));
+                            const okSteps = (merged[appId].durations[dur].steps || [])
+                                .map(x => x === 'vietuser' ? 'sitetop' : x)
+                                .filter(x => SHORTENER_IDS.includes(x));
                             merged[appId].durations[dur].steps = okSteps.length ? okSteps : fallbackSteps;
                         }
                     }
@@ -603,7 +604,9 @@ async function saveAppsConfig() {
 function sanitizeSteps(steps, duration) {
     const max = DURATION_MAX_STEPS[duration] || 5;
     if (!Array.isArray(steps)) return null;
-    const clean = steps.filter(s => s !== '' && s !== null && s !== undefined);
+    const clean = steps
+        .filter(s => s !== '' && s !== null && s !== undefined)
+        .map(s => s === 'vietuser' ? 'sitetop' : s);
     if (clean.some(s => !SHORTENER_IDS.includes(s))) return null;
     if (clean.length < 1 || clean.length > max) return null;
     return clean;
@@ -770,7 +773,7 @@ function isRefererValid(referer, expectedHost) {
             const expBare = String(expectedHost).toLowerCase().replace(/^www\./, '');
             if (bare === expBare || bare.endsWith('.' + expBare)) return true;
         }
-        if (/^(link4m|trafficvn|link999|vietuser|layma)\.[a-z0-9.-]+$/i.test(bare)) return true;
+        if (/^(link4m|trafficvn|link999|sitetop|layma)\.[a-z0-9.-]+$/i.test(bare)) return true;
         return false;
     } catch (e) { return false; }
 }
@@ -835,7 +838,7 @@ function stepsForHours(h) {
 }
 
 // ============================================
-// 🔗 TẠO LINK RÚT GỌN ĐÃ SỬA HOÀN CHỈNH (Link4M / TrafficVN / Link999 / VietUser / Layma)
+// 🔗 TẠO LINK RÚT GỌN ĐÃ SỬA HOÀN CHỈNH (Link4M / TrafficVN / Link999 / SiteTop / Layma)
 // ============================================
 const SHORT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const SHORT_TIMEOUT_MS = 9000;
@@ -843,7 +846,7 @@ const shortenerLast = {};
 
 function maskSecrets(str) {
     let t = String(str);
-    [LINK4M_API_KEY, TRAFFICVN_API_KEY, LINK999_API_KEY, VIETUSER_API_KEY, LAYMA_API_KEY].forEach(k => { if (k) t = t.split(k).join('***'); });
+    [LINK4M_API_KEY, TRAFFICVN_API_KEY, LINK999_API_KEY, SITETOP_API_KEY, LAYMA_API_KEY].forEach(k => { if (k) t = t.split(k).join('***'); });
     return t;
 }
 function shortHeaders(extra) {
@@ -938,15 +941,15 @@ async function genStLink(baseUrl, token, cb, extra, trace, names) {
     return {};
 }
 
-async function genApiLink(apiUrl, token, cb, extra, fmt, trace, names) {
+async function genApiLink(apiUrl, token, cb, extra, fmt, trace, names, extraHeaders) {
     const nm = names || { token: 'api', url: 'url' };
     const baseParams = {};
-    baseParams[nm.token] = token;
+    if (nm.token) baseParams[nm.token] = token;
     baseParams[nm.url] = cb;
     if (fmt) baseParams.format = fmt;
     const params = new URLSearchParams(Object.assign(baseParams, extra || {}));
     const fullUrl = apiUrl + '?' + params;
-    const r = await fetch(fullUrl, { redirect: 'follow', headers: shortHeaders(), signal: AbortSignal.timeout(SHORT_TIMEOUT_MS) });
+    const r = await fetch(fullUrl, { redirect: 'follow', headers: shortHeaders(extraHeaders), signal: AbortSignal.timeout(SHORT_TIMEOUT_MS) });
     const x = await stRead(r, fullUrl, trace);
     return x;
 }
@@ -989,20 +992,22 @@ async function genShortLink(type, cb, traceArg, opts) {
             if (url && /^http:\/\/(www\.)?link999\.app\//i.test(url)) {
                 url = url.replace(/^http:\/\//i, 'https://');
             }
-        } else if (type === 'vietuser') {
-            // ✅ ĐÃ SỬA: Gọi đúng endpoint /api-shorten/v2 và /st của VietUser; nếu tài khoản VietUser chưa được duyệt nguồn thì tự động dự phòng sang Link4M để không kẹt bước
-            trace.push('Cach 1 (API v2): ' + VIETUSER_API_URL);
-            let x = await genApiLink(VIETUSER_API_URL, VIETUSER_API_KEY, cb, {}, 'json', trace);
+        } else if (type === 'sitetop') {
+            // ✅ ĐÃ THÊM: Gọi API SiteTop từ server (Cách 1: ?api=TOKEN&url=CB + Authorization: Bearer TOKEN)
+            trace.push('API SiteTop: ' + SITETOP_API_URL);
+            const x = await genApiLink(
+                SITETOP_API_URL,
+                SITETOP_API_KEY,
+                cb,
+                {},
+                null,
+                trace,
+                { token: 'api', url: 'url' },
+                { 'Authorization': 'Bearer ' + SITETOP_API_KEY }
+            );
             if (x.link) url = x.link;
-            if (!url && !x.serviceError) {
-                trace.push('Cach 2 (QuickLink /st): ' + VIETUSER_ST_URL);
-                x = await genStLink(VIETUSER_ST_URL, VIETUSER_API_KEY, cb, {}, trace);
-                if (x.link) url = x.link;
-            }
-            if (!url && x.serviceError && options.allowFallback !== false) {
-                trace.push('Tai khoan VietUser chua duyet nguon -> Tu dong chuyen du phong sang Link4M: ' + LINK4M_API_URL);
-                const fb = await genApiLink(LINK4M_API_URL, LINK4M_API_KEY, cb, {}, 'json', trace);
-                if (fb.link) url = fb.link;
+            if (url && /^http:\/\/(www\.)?sitetop\.net\//i.test(url)) {
+                url = url.replace(/^http:\/\//i, 'https://');
             }
         } else if (type === 'layma') {
             // ✅ ĐÃ SỬA: Thử lấy link từ máy chủ trước; nếu Cloudflare trên api.layma.net chặn IP máy chủ (Render/Cloud 403),
@@ -2336,7 +2341,7 @@ ${GUIDE_HTML}
 <ol style="margin:10px 0 0;padding-left:20px;font-size:12.5px;line-height:1.6;color:var(--text-dim)">
 <li>Chọn app ở trên (<b>NetSuper</b> hoặc <b>NetSuperVip</b>) — mỗi app có thứ tự riêng.</li>
 <li>Mỗi mốc giờ (3H, 6H, 8H, 12H, 24H) có một danh sách bước xếp <b>từ trên xuống</b>: người dùng làm bước 1 trước, rồi bước 2, bước 3...</li>
-<li>Bấm <b>+ Link4M / + TrafficVN / + Link999 / + VietUser / + Layma</b> để thêm bước. Dùng <b>▲ ▼</b> để đổi thứ tự, <b>✕</b> để xoá. Một link được dùng nhiều lần.</li>
+<li>Bấm <b>+ Link4M / + TrafficVN / + Link999 / + SiteTop / + Layma</b> để thêm bước. Dùng <b>▲ ▼</b> để đổi thứ tự, <b>✕</b> để xoá. Một link được dùng nhiều lần.</li>
 <li>Số bước tối đa mỗi mốc: 3H = 1, 6H = 2, 8H = 3, 12H = 4, 24H = 5.</li>
 <li><b>💾 LƯU CHO TOÀN SERVER</b>: lưu vĩnh viễn, ai lấy key ở mốc giờ đó cũng phải vượt đúng thứ tự này. Hai ô <b>Ẩn / Bảo trì</b> cũng được lưu cùng lúc.</li>
 <li><b>🔗 TẠO LINK THEO THỨ TỰ NÀY</b>: tạo nhiệm vụ ngay theo thứ tự đang chọn mà <b>không lưu</b> — bấm “MỞ LINK” rồi tự vượt để nhận key.</li>
@@ -2344,7 +2349,7 @@ ${GUIDE_HTML}
 </ol>
 </details>
 <div style="margin:10px 0">
-<button class="btn-purple" type="button" onclick="testShorteners()" style="margin-top:0">🧪 KIỂM TRA TẠO LINK (Link4M · TrafficVN · Link999 · VietUser · Layma)</button>
+<button class="btn-purple" type="button" onclick="testShorteners()" style="margin-top:0">🧪 KIỂM TRA TẠO LINK (Link4M · TrafficVN · Link999 · SiteTop · Layma)</button>
 <div id="shortenerTestBox" style="margin-top:8px"></div>
 </div>
 <div id="adminAppPrefixBox" style="padding:12px;margin-top:6px;border-radius:12px;background:var(--field);border:1px solid var(--line)"></div>
@@ -2666,7 +2671,7 @@ async function addWhitelistIp() {
 
 let adminAppConfigCache = null;
 let adminOrder = {};
-let adminShorteners = [{id:'link4m',label:'Link4M',seconds:80},{id:'trafficvn',label:'TrafficVN',seconds:90},{id:'link999',label:'Link999 (Google Search 4 Step)',seconds:90},{id:'vietuser',label:'VietUser',seconds:90},{id:'layma',label:'Layma',seconds:90}];
+let adminShorteners = [{id:'link4m',label:'Link4M',seconds:80},{id:'trafficvn',label:'TrafficVN',seconds:90},{id:'link999',label:'Link999 (Google Search 4 Step)',seconds:90},{id:'sitetop',label:'SiteTop',seconds:90},{id:'layma',label:'Layma',seconds:90}];
 let currentAdminApp = 'netsuper';
 const DURATION_ORDER = ['3h','6h','8h','12h','24h'];
 function switchAdminApp(appId) {
@@ -3419,7 +3424,7 @@ async function refresh() {
     if (i < doneCount) { cls='done'; icon='✓'; }
     else if (i === j.currentStep) { cls='current'; icon='▶'; }
     row.className = 'step-row ' + cls;
-    const label = ({link4m:'Link4M (80s)', trafficvn:'TrafficVN (90s)', link999:'Link999 (90s)', vietuser:'VietUser (90s)', layma:'Layma (90s)'})[type] || type;
+    const label = ({link4m:'Link4M (80s)', trafficvn:'TrafficVN (90s)', link999:'Link999 (90s)', sitetop:'SiteTop (90s)', layma:'Layma (90s)'})[type] || type;
     row.innerHTML = '<span class="step-icon">' + icon + '</span> ' + t('step') + ' ' + (i+1) + '/' + j.total + ' — ' + label;
     prog.appendChild(row);
   });
